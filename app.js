@@ -49,6 +49,28 @@ function initMap() {
   log('initMap: map ready');
 }
 
+// ---- mobile drawer (temporary Material-style side sheet) --------------
+// Below the CSS breakpoint the sidebar becomes an overlay drawer: a
+// hamburger button opens it, a scrim behind it closes it on tap, and
+// starting a draw/build auto-closes it so the map/preview underneath is
+// immediately visible (matching the affordances of Google's Material
+// nav drawer). Above the breakpoint these are all no-ops since the CSS
+// only positions #sidebar as fixed under max-width:720px.
+var MOBILE_MQ = '(max-width: 720px)';
+function isMobileLayout() { return window.matchMedia(MOBILE_MQ).matches; }
+function openSidebar() {
+  $('sidebar').classList.add('open');
+  $('sidebar-scrim').classList.add('show');
+}
+function closeSidebar() {
+  $('sidebar').classList.remove('open');
+  $('sidebar-scrim').classList.remove('show');
+  // Leaflet caches its container size; a drawer opening/closing changes
+  // the map's visible box on mobile (the map sits under the scrim), so
+  // nudge it to re-measure once the slide transition finishes.
+  if (map) setTimeout(function () { map.invalidateSize(); }, 260);
+}
+
 function setBox(n, s, e, w) {
   var latlngs = [[s, w], [n, e]];
   if (boxLayer) { boxLayer.setBounds(latlngs); }
@@ -368,12 +390,26 @@ async function renderMesh(positionsBuf, indicesBuf) {
 // ---- wire up ----------------------------------------------------------
 document.addEventListener('DOMContentLoaded', function () {
   initMap();
-  $('draw-btn').addEventListener('click', startDrawing);
-  $('apply-latlng').addEventListener('click', applyLatLngBounds);
+  $('draw-btn').addEventListener('click', function () {
+    startDrawing();
+    if (isMobileLayout()) closeSidebar();   // reveal the map to drag on
+  });
+  $('apply-latlng').addEventListener('click', function () {
+    applyLatLngBounds();
+    if (isMobileLayout()) closeSidebar();
+  });
+  $('menu-btn').addEventListener('click', openSidebar);
+  $('sidebar-close').addEventListener('click', closeSidebar);
+  $('sidebar-scrim').addEventListener('click', closeSidebar);
   makeMutex('model_thickness_cm', 'elevation_distortion');
   makeMutex('elevation_distortion', 'model_thickness_cm');
   $('model_width_cm').addEventListener('input', function () { updateHeight(); maybeEnableBuild(); });
   $('model_height_cm').addEventListener('change', function () { updateWidth(); maybeEnableBuild(); });
-  $('build-form').addEventListener('submit', function (e) { e.preventDefault(); doBuild(); });
+  $('build-form').addEventListener('submit', function (e) {
+    e.preventDefault();
+    if (isMobileLayout()) closeSidebar();   // let the build/preview overlay take the screen
+    doBuild();
+  });
   $('preview-close').addEventListener('click', function () { $('preview-panel').style.display = 'none'; });
+  window.addEventListener('resize', function () { if (map) map.invalidateSize(); });
 });
