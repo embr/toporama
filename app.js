@@ -21,6 +21,9 @@ window.addEventListener('unhandledrejection', function (e) {
 
 // bounds is a plain {north, south, east, west} object (no map-lib types).
 var map, boxLayer = null, bounds = null, drawing = false, drawSession = null;
+var cornerHandles = [];        // 4 draggable L.markers on the box corners
+var pins = [];                 // L.markers for pin-hole locations
+var activeTool = null;         // null | 'pin'  (drawing has its own state)
 
 // ---- small helpers ----------------------------------------------------
 function $(id) { return document.getElementById(id); }
@@ -81,6 +84,61 @@ function setBox(n, s, e, w) {
 }
 function clearBox() {
   if (boxLayer) { map.removeLayer(boxLayer); boxLayer = null; }
+  removeCornerHandles();
+}
+
+// ---- draggable corner handles to resize the box -------------------------
+// Four small square markers, one per corner. Dragging one moves that
+// corner while the opposite corner stays put (the usual rectangle-resize
+// affordance). Handles are plain draggable markers, so this works with
+// both mouse and touch for free.
+var HANDLE_ICON = L.divIcon({
+  className: 'corner-handle', iconSize: [18, 18], iconAnchor: [9, 9]
+});
+// corner order: 0=NW 1=NE 2=SE 3=SW
+function cornerLatLng(i) {
+  return [
+    [bounds.north, bounds.west], [bounds.north, bounds.east],
+    [bounds.south, bounds.east], [bounds.south, bounds.west]
+  ][i];
+}
+function removeCornerHandles() {
+  cornerHandles.forEach(function (h) { map.removeLayer(h); });
+  cornerHandles = [];
+}
+function updateCornerHandles() {
+  if (!bounds || !cornerHandles.length) return;
+  for (var i = 0; i < 4; i++) cornerHandles[i].setLatLng(cornerLatLng(i));
+}
+function addCornerHandles() {
+  removeCornerHandles();
+  if (!bounds) return;
+  for (var i = 0; i < 4; i++) {
+    (function (idx) {
+      var h = L.marker(cornerLatLng(idx), {
+        icon: HANDLE_ICON, draggable: true, keyboard: false, zIndexOffset: 1000
+      }).addTo(map);
+      h.on('drag', function (ev) {
+        var p = ev.target.getLatLng();
+        // the opposite corner (idx+2 mod 4) is the anchor
+        var a = cornerLatLng((idx + 2) % 4);
+        bounds = {
+          north: Math.max(p.lat, a[0]), south: Math.min(p.lat, a[0]),
+          east: Math.max(p.lng, a[1]), west: Math.min(p.lng, a[1])
+        };
+        setBox(bounds.north, bounds.south, bounds.east, bounds.west);
+        // move the two adjacent handles live (not the one being dragged)
+        for (var k = 0; k < 4; k++)
+          if (k !== idx) cornerHandles[k].setLatLng(cornerLatLng(k));
+      });
+      h.on('dragend', function () {
+        updateCornerHandles();           // snap the dragged one to the corner
+        updateHeight(); maybeEnableBuild();
+        log('box resized via corner drag:', bounds);
+      });
+      cornerHandles.push(h);
+    })(i);
+  }
 }
 
 // ---- click-and-drag (or touch-and-drag) box drawing --------------------
@@ -108,6 +166,7 @@ function cancelDrawSession() {
 function startDrawing() {
   if (!map) return;
   cancelDrawSession();
+  setPinMode(false);
   clearBox();
   bounds = null; maybeEnableBuild();
   drawing = true;
@@ -169,9 +228,55 @@ function startDrawing() {
 function finishBox(n, s, e, w) {
   bounds = { north: n, south: s, east: e, west: w };
   setBox(n, s, e, w);
+  addCornerHandles();
   $('draw-btn').textContent = 'REDRAW BOX';
+  $('pin-btn').disabled = false;
   updateHeight(); maybeEnableBuild();
   log('box finished:', bounds);
+  toast('drag a corner to fine-tune the box');
+}
+
+// ---- pin-hole tool ------------------------------------------------------
+// Tap the map (inside the box) to drop a pin: the printed model gets a
+// small blind hole there sized for a physical map pin. Pins are draggable;
+// tapping a pin removes it.
+var PIN_ICON = L.divIcon({
+  className: 'pin-marker', iconSize: [16, 16], iconAnchor: [8, 8]
+});
+function insideBounds(latlng) {
+  return bounds && latlng.lat <= bounds.north && latlng.lat >= bounds.south &&
+         latlng.lng <= bounds.east && latlng.lng >= bounds.west;
+}
+function updatePinStatus() {
+  var el = $('pin-status');
+  el.textContent = pins.length
+    ? pins.length + ' pin hole' + (pins.length > 1 ? 's' : '') +
+      ' · tap a pin to remove it'
+    : '';
+}
+function addPin(latlng) {
+  var p = L.marker(latlng, {
+    icon: PIN_ICON, draggable: true, keyboard: false, zIndexOffset: 900
+  }).addTo(map);
+  p.on('click', function () {          // tap a pin to remove it
+    map.removeLayer(p);
+    pins.splice(pins.indexOf(p), 1);
+    updatePinStatus();
+  });
+  pins.push(p);
+  updatePinStatus();
+}
+function onMapClickForPin(e) {
+  if (activeTool !== 'pin') return;
+  if (!insideBounds(e.latlng)) { toast('pins must be inside the box'); return; }
+  addPin(e.latlng);
+}
+function setPinMode(on) {
+  activeTool = on ? 'pin' : null;
+  $('pin-btn').textContent = on ? 'DONE ADDING PINS' : 'ADD PIN HOLES';
+  $('pin-btn').classList.toggle('active-tool', on);
+  map.getContainer().style.cursor = on ? 'crosshair' : '';
+  if (on) toast('tap inside the box to place pin holes');
 }
 
 // ---- set box from typed lat/long coordinates (advanced) ---------------
@@ -264,6 +369,22 @@ function buildModelConfig() {
   var dnmax = numOrNull('dn_max'); if (dnmax !== null) model.distortion_normalization_max = dnmax;
   var mp = numOrNull('max_points');
   model.max_points = Math.max(2, Math.min(2000, mp ? Math.round(mp) : 500));
+
+  // pin holes: pass only pins inside the current box, as [lng, lat] pairs
+  var pinLocs = [];
+  pins.forEach(function (p) {
+    var ll = p.getLatLng();
+    if (insideBounds(ll)) pinLocs.push([ll.lng, ll.lat]);
+  });
+  if (pinLocs.length < pins.length)
+    toast((pins.length - pinLocs.length) + ' pin(s) outside the box were skipped');
+  if (pinLocs.length) {
+    model.pin_holes = {
+      locations: pinLocs,
+      diameter_mm: numOrNull('pin_diameter_mm') || 2.0,
+      depth_mm: numOrNull('pin_depth_mm') || 5.0
+    };
+  }
   return model;
 }
 
@@ -351,6 +472,9 @@ function showPreview(d) {
   add('grid', d.model.max_points + ' pts → ' + d.num_vertices.toLocaleString() + ' vertices');
   add('grid spacing (m)', d.grid_spacing_m.toFixed(1));
   if (d.resolution) add('tile resolution (m)', '~' + d.resolution.median + ' (zoom ' + d.zoom + ')');
+  if (d.model.pin_holes)
+    add('pin holes', d.model.pin_holes.locations.length + ' × ø' +
+        d.model.pin_holes.diameter_mm + ' mm, ' + d.model.pin_holes.depth_mm + ' mm deep');
   if (d.resolution && d.resolution.median > 2 * d.grid_spacing_m)
     add('note', 'terrain tiles are coarser than the grid here — extra points cannot add detail');
   meta.appendChild(dl2);
@@ -427,6 +551,11 @@ document.addEventListener('DOMContentLoaded', function () {
     startDrawing();
     closeSidebar();   // no-op on desktop; reveals the map to drag on mobile
   });
+  $('pin-btn').addEventListener('click', function () {
+    setPinMode(activeTool !== 'pin');
+    if (activeTool === 'pin') closeSidebar();
+  });
+  map.on('click', onMapClickForPin);
   $('apply-latlng').addEventListener('click', function () {
     applyLatLngBounds();
     closeSidebar();
@@ -443,6 +572,12 @@ document.addEventListener('DOMContentLoaded', function () {
     closeSidebar();   // let the build/preview overlay take the screen
     doBuild();
   });
-  $('preview-close').addEventListener('click', function () { $('preview-panel').style.display = 'none'; });
+  $('preview-close').addEventListener('click', function () {
+    // back to the map with the box, handles, and pins exactly as they were
+    // (bounds/boxLayer are never cleared by a build), so the user can nudge
+    // a corner or add pins and hit BUILD again.
+    $('preview-panel').style.display = 'none';
+    if (map) map.invalidateSize();
+  });
   window.addEventListener('resize', function () { if (map) map.invalidateSize(); });
 });

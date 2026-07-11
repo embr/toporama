@@ -582,12 +582,50 @@
     return { xyScale: xyScale, zScale: zScale, zDistortion: zDistortion };
   }
 
+  // Carve blind pin holes into the (already model-scale) top heightfield.
+  // Each hole is a flat-floored depression: every grid vertex within
+  // radius drops to (surface at pin) - depth. Because the bottom shell is
+  // derived FROM the top (makeBottom projects it down), depressing the top
+  // keeps the solid watertight for free — no CSG needed. The hole's wall
+  // slope is set by grid spacing, so denser grids (higher max_points) give
+  // crisper holes. If the grid is too coarse for any vertex to fall inside
+  // the radius, the nearest vertex is lowered so a hole always appears.
+  // Floors are clamped to the grid's lowest terrain z so a hole in a valley
+  // can't punch below the model base.
+  function carvePinHoles(pts, m, n, holes, xyScale) {
+    var N = m * n, i, radius = holes.diameter_mm / 2000 /* mm -> m */;
+    var depth = holes.depth_mm / 1000;
+    var zFloorMin = Infinity;
+    for (i = 0; i < N; i++) if (pts[i * 3 + 2] < zFloorMin) zFloorMin = pts[i * 3 + 2];
+    holes.locations.forEach(function (loc) {
+      var p = project(loc[0], loc[1]);
+      var px = p[0] * xyScale, py = p[1] * xyScale;
+      // surface height at the pin = z of the nearest grid vertex
+      var best = -1, bestD2 = Infinity;
+      for (i = 0; i < N; i++) {
+        var dx = pts[i * 3] - px, dy = pts[i * 3 + 1] - py;
+        var d2 = dx * dx + dy * dy;
+        if (d2 < bestD2) { bestD2 = d2; best = i; }
+      }
+      var floor = Math.max(pts[best * 3 + 2] - depth, zFloorMin);
+      var hit = 0;
+      for (i = 0; i < N; i++) {
+        var ddx = pts[i * 3] - px, ddy = pts[i * 3 + 1] - py;
+        if (ddx * ddx + ddy * ddy <= radius * radius) {
+          if (pts[i * 3 + 2] > floor) pts[i * 3 + 2] = floor;
+          hit++;
+        }
+      }
+      if (!hit && pts[best * 3 + 2] > floor) pts[best * 3 + 2] = floor;
+    });
+  }
+
   // Assemble the solid from an (m*n) grid of world-meter points
   // ptsWorld: Float64Array length 3*m*n (x_mercator, y_mercator, elev).
   // model: {output_x_meters, output_z_meters?|output_z_distortion,
   //         top_thickness, top_pad_width, wall_thickness, min_z_val,
   //         distortion_exponent?, distortion_normalization_min/max?,
-  //         tiled?, upload_scale?}
+  //         tiled?, upload_scale?, pin_holes?}
   function buildSolid(model, ptsWorld, m, n) {
     var info = {};
     if (model.distortion_exponent !== undefined && model.distortion_exponent !== null) {
@@ -602,6 +640,10 @@
     info.xy_scale = scale.xyScale;
     info.z_scale = scale.zScale;
     info.output_z_distortion = scale.zDistortion;
+
+    if (model.pin_holes && model.pin_holes.locations &&
+        model.pin_holes.locations.length)
+      carvePinHoles(ptsWorld, m, n, model.pin_holes, scale.xyScale);
 
     var top = makeTop(ptsWorld, m, n, model.top_pad_width);
     var bottom = makeBottom(top, model.top_thickness, model.wall_thickness,
