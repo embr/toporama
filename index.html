@@ -180,9 +180,13 @@
     body.mobile #menu-btn { display: flex; }
     /* preview/build overlays should sit above a stray open drawer too */
     body.mobile #preview-panel, body.mobile #building-overlay { z-index: 25; }
-    /* the hamburger sits where Leaflet's zoom control normally is;
-       push the control down out of the way */
-    body.mobile .leaflet-top.leaflet-left { margin-top: 64px; }
+    /* the hamburger sits where Leaflet's zoom control normally is; push
+       the control down below it and center both on the same vertical axis
+       (hamburger center = 14px + 44/2 = 36px; Leaflet adds its own 10px
+       control margin; zoom bar is 26px wide, or 34px with the touch
+       border, hence the two offsets) */
+    body.mobile .leaflet-top.leaflet-left { margin-top: 64px; margin-left: 13px; }
+    body.mobile .leaflet-touch .leaflet-top.leaflet-left { margin-left: 9px; }
   </style>
 </head>
 <body>
@@ -334,8 +338,8 @@
         "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
     } }
   </script>
-  <script src="topocore.js?v=11"></script>
-  <script src="elevation.js?v=11"></script>
-  <script type="module" src="app.js?v=11"></script>
+  <script src="topocore.js?v=13"></script>
+  <script src="elevation.js?v=13"></script>
+  <script type="module" src="app.js?v=13"></script>
 </body>
 </html>

@@ -82,10 +82,20 @@ function initMap() {
   map = L.map('map', {
     zoomControl: true, attributionControl: true, inertiaMaxSpeed: 1500
   }).setView([46.8523, -121.7603], 10);   // Mt Rainier
-  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  var streets = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19,
     attribution: '© OpenStreetMap contributors'
   }).addTo(map);
+  // Esri World Imagery: keyless satellite/aerial tiles (attribution
+  // required, no key or billing) — resolution varies by region, so cap at
+  // a zoom that's available nearly everywhere.
+  var satellite = L.tileLayer(
+    'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+      maxZoom: 19, maxNativeZoom: 18,
+      attribution: '© Esri, Maxar, Earthstar Geographics'
+    });
+  L.control.layers({ 'Map': streets, 'Satellite': satellite }, null,
+    { position: 'topright' }).addTo(map);
   log('initMap: map ready');
 }
 
