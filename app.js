@@ -20,10 +20,11 @@ window.addEventListener('unhandledrejection', function (e) {
 });
 
 // bounds is a plain {north, south, east, west} object (no map-lib types).
-var map, boxLayer = null, bounds = null, drawing = false, drawSession = null;
+var map, boxLayer = null, bounds = null;
 var cornerHandles = [];        // 4 draggable L.markers on the box corners
+var moveHandle = null;         // center L.marker that drags the whole box
 var pins = [];                 // L.markers for pin-hole locations
-var activeTool = null;         // null | 'pin'  (drawing has its own state)
+var activeTool = null;         // null | 'pin'
 
 // ---- small helpers ----------------------------------------------------
 function $(id) { return document.getElementById(id); }
@@ -48,10 +49,20 @@ function actionToast(msg, btnLabel, cb) {
   el.classList.add('action');
   el.style.display = 'flex';
 }
-// true when the sidebar is in overlay-drawer mode (the mobile breakpoint) —
-// read from the CSS itself so there's no duplicated breakpoint constant.
+// ---- layout mode --------------------------------------------------------
+// The mobile layout is keyed off a `mobile` class on <body>, applied here —
+// not off a CSS @media query directly. One JS decision drives both the CSS
+// (all mobile rules are under body.mobile) and the JS behaviors (like the
+// confirm toast), so the two can never disagree. `?mobile=1` forces mobile
+// layout at any window size — a test harness for desktop browsers whose
+// minimum window width is larger than the breakpoint.
+function applyLayoutMode() {
+  var force = /[?&]mobile=1/.test(location.search);
+  var mobile = force || window.matchMedia('(max-width: 720px)').matches;
+  document.body.classList.toggle('mobile', mobile);
+}
 function sidebarIsDrawer() {
-  return getComputedStyle($('sidebar')).position === 'fixed';
+  return document.body.classList.contains('mobile');
 }
 function showError(msg) { var e = $('err'); e.textContent = msg; e.style.display = 'block'; }
 function clearError() { $('err').style.display = 'none'; }
@@ -65,8 +76,12 @@ var RECT_STYLE = { color: '#6c6c6c', weight: 3, fillColor: '#926239', fillOpacit
 
 function initMap() {
   log('initMap: creating Leaflet map');
-  map = L.map('map', { zoomControl: true, attributionControl: true })
-    .setView([46.8523, -121.7603], 10);   // Mt Rainier
+  // inertiaMaxSpeed: an aggressive flick (or a synthetic test drag) can
+  // otherwise fling the map thousands of km and strand the user over
+  // empty ocean; this caps the glide to something recoverable.
+  map = L.map('map', {
+    zoomControl: true, attributionControl: true, inertiaMaxSpeed: 1500
+  }).setView([46.8523, -121.7603], 10);   // Mt Rainier
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 19,
     attribution: '© OpenStreetMap contributors'
@@ -117,6 +132,10 @@ function clearBox() {
 var HANDLE_ICON = L.divIcon({
   className: 'corner-handle', iconSize: [18, 18], iconAnchor: [9, 9]
 });
+var MOVE_ICON = L.divIcon({
+  className: 'move-handle', iconSize: [26, 26], iconAnchor: [13, 13],
+  html: '&#x2725;'   // ✥ four-directions arrow
+});
 // corner order: 0=NW 1=NE 2=SE 3=SW
 function cornerLatLng(i) {
   return [
@@ -127,10 +146,15 @@ function cornerLatLng(i) {
 function removeCornerHandles() {
   cornerHandles.forEach(function (h) { map.removeLayer(h); });
   cornerHandles = [];
+  if (moveHandle) { map.removeLayer(moveHandle); moveHandle = null; }
+}
+function boxCenter() {
+  return [(bounds.north + bounds.south) / 2, (bounds.east + bounds.west) / 2];
 }
 function updateCornerHandles() {
   if (!bounds || !cornerHandles.length) return;
   for (var i = 0; i < 4; i++) cornerHandles[i].setLatLng(cornerLatLng(i));
+  if (moveHandle) moveHandle.setLatLng(boxCenter());
 }
 function addCornerHandles() {
   removeCornerHandles();
@@ -161,106 +185,69 @@ function addCornerHandles() {
       cornerHandles.push(h);
     })(i);
   }
+  // center handle: drag to move the whole box without resizing it
+  moveHandle = L.marker(boxCenter(), {
+    icon: MOVE_ICON, draggable: true, keyboard: false, zIndexOffset: 1100
+  }).addTo(map);
+  // anchor the whole drag to its starting state and apply an ABSOLUTE
+  // delta each event — accumulating incremental deltas drifts if any
+  // single event is dropped or re-ordered mid-drag
+  var dragStart = null;
+  moveHandle.on('dragstart', function (ev) {
+    dragStart = { bounds: bounds, at: ev.target.getLatLng() };
+  });
+  moveHandle.on('drag', function (ev) {
+    if (!dragStart) return;
+    var p = ev.target.getLatLng();
+    var dLat = p.lat - dragStart.at.lat, dLng = p.lng - dragStart.at.lng;
+    bounds = {
+      north: dragStart.bounds.north + dLat, south: dragStart.bounds.south + dLat,
+      east: dragStart.bounds.east + dLng, west: dragStart.bounds.west + dLng
+    };
+    setBox(bounds.north, bounds.south, bounds.east, bounds.west);
+    for (var k = 0; k < 4; k++) cornerHandles[k].setLatLng(cornerLatLng(k));
+  });
+  moveHandle.on('dragend', function () {
+    dragStart = null;
+    updateCornerHandles();
+    updateHeight(); maybeEnableBuild();
+    log('box moved via center drag:', bounds);
+  });
 }
 
-// ---- click-and-drag (or touch-and-drag) box drawing --------------------
-// This uses Pointer Events, not Leaflet's mouse events. Mouse and touch
-// input both fire pointerdown/pointermove/pointerup, so one code path
-// drives both a mouse drag and a finger drag. A prior version listened for
-// plain 'mousedown'/'mousemove'/'mouseup' via map.on(...), which works for
-// a mouse but is silently broken on touchscreens: a touch drag never fires
-// a native 'mousemove' event, so the box never updated and every touch
-// looked like a no-op tap.
-function cancelDrawSession() {
-  if (!drawSession) return;
-  var c = map.getContainer();
-  c.removeEventListener('pointerdown', drawSession.onDown);
-  c.removeEventListener('pointermove', drawSession.onMove);
-  c.removeEventListener('pointerup', drawSession.onUp);
-  c.removeEventListener('pointercancel', drawSession.onUp);
-  c.style.touchAction = '';
-  drawSession = null;
-  drawing = false;
-  if (map.dragging) map.dragging.enable();
-  c.style.cursor = '';
-}
-
-function startDrawing() {
+// ---- box placement ------------------------------------------------------
+// Pan and zoom are ALWAYS the default map gestures — there is no modal
+// "drawing" state to fight with them (an earlier drag-to-draw mode was
+// unusable on phones: you couldn't reposition the map without first
+// leaving the mode). Instead, PLACE BOX drops a box in the middle of the
+// current view at 50% of the viewport size, and the user adjusts it with
+// the corner handles (resize) and the center handle (move). Pressing the
+// button again re-centers the existing box in the current view.
+function placeBox() {
   if (!map) return;
-  cancelDrawSession();
   setPinMode(false);
-  clearBox();
-  bounds = null; maybeEnableBuild();
-  drawing = true;
-  var c = map.getContainer();
-  c.style.cursor = 'crosshair';
-  // Without this the browser treats a finger drag as a page-pan/scroll
-  // gesture and never delivers pointermove events to us.
-  c.style.touchAction = 'none';
-  if (map.dragging) map.dragging.disable();   // don't pan while drawing
-  toast('drag (finger or mouse) to select a region');
-
-  var s = { start: null, pointerId: null };
-  s.onDown = function (e) {
-    if (s.pointerId !== null) return;   // ignore a second finger mid-drag
-    // Don't hijack taps on Leaflet's own UI (zoom +/-, attribution, etc).
-    // Leaflet's controls stop its *own* mouse/touch handling from leaking
-    // through them, but that doesn't cover this listener — without this
-    // check, touching the zoom button also started a (zero-movement) box.
-    if (e.target.closest('.leaflet-control')) return;
-    s.pointerId = e.pointerId;
-    s.start = map.mouseEventToLatLng(e);
-    try { c.setPointerCapture(e.pointerId); } catch (err) {}
-    e.preventDefault();
-  };
-  s.onMove = function (e) {
-    if (s.start === null || e.pointerId !== s.pointerId) return;
-    var a = s.start, b = map.mouseEventToLatLng(e);
-    setBox(Math.max(a.lat, b.lat), Math.min(a.lat, b.lat),
-           Math.max(a.lng, b.lng), Math.min(a.lng, b.lng));
-    e.preventDefault();
-  };
-  s.onUp = function (e) {
-    if (s.start === null || e.pointerId !== s.pointerId) return;
-    var a = s.start, b = map.mouseEventToLatLng(e);
-    s.start = null; s.pointerId = null;
-    try { c.releasePointerCapture(e.pointerId); } catch (err) {}
-    var tiny = Math.abs(b.lat - a.lat) < 1e-4 && Math.abs(b.lng - a.lng) < 1e-4;
-    if (tiny) { clearBox(); return; }   // a tap, not a drag: stay armed
-    c.removeEventListener('pointerdown', s.onDown);
-    c.removeEventListener('pointermove', s.onMove);
-    c.removeEventListener('pointerup', s.onUp);
-    c.removeEventListener('pointercancel', s.onUp);
-    drawSession = null;
-    drawing = false;
-    if (map.dragging) map.dragging.enable();
-    c.style.cursor = '';
-    c.style.touchAction = '';
-    finishBox(Math.max(a.lat, b.lat), Math.min(a.lat, b.lat),
-              Math.max(a.lng, b.lng), Math.min(a.lng, b.lng));
-  };
-
-  drawSession = s;
-  c.addEventListener('pointerdown', s.onDown);
-  c.addEventListener('pointermove', s.onMove);
-  c.addEventListener('pointerup', s.onUp);
-  c.addEventListener('pointercancel', s.onUp);
+  var vb = map.getBounds();
+  var cLat = (vb.getNorth() + vb.getSouth()) / 2;
+  var cLng = (vb.getEast() + vb.getWest()) / 2;
+  var halfH = (vb.getNorth() - vb.getSouth()) * 0.25;   // half of 50% view
+  var halfW = (vb.getEast() - vb.getWest()) * 0.25;
+  finishBox(cLat + halfH, cLat - halfH, cLng + halfW, cLng - halfW);
 }
 
 function finishBox(n, s, e, w) {
   bounds = { north: n, south: s, east: e, west: w };
   setBox(n, s, e, w);
   addCornerHandles();
-  $('draw-btn').textContent = 'REDRAW BOX';
+  $('draw-btn').textContent = 'RECENTER BOX';
   $('pin-btn').disabled = false;
   updateHeight(); maybeEnableBuild();
   log('box finished:', bounds);
   if (sidebarIsDrawer())
-    // drawer is collapsed on mobile after drawing — give the user an
-    // explicit "done" button that brings the settings back
-    actionToast('Drag corners to adjust', 'BOX LOOKS GOOD ✓', openSidebar);
+    // drawer is collapsed on mobile — pan/zoom/adjust freely, then use the
+    // toast button to bring the settings back when the box looks right
+    actionToast('Pan the map, drag corners or ✥ to adjust', 'BOX LOOKS GOOD ✓', openSidebar);
   else
-    toast('drag a corner to fine-tune the box');
+    toast('drag a corner to resize, ✥ to move');
 }
 
 // ---- pin-hole tool ------------------------------------------------------
@@ -322,7 +309,6 @@ function applyLatLngBounds() {
     showError('longitude must be between -180 and 180'); return;
   }
   if (w > e) { var t = w; w = e; e = t; }   // normalize
-  cancelDrawSession();
   finishBox(n, s, e, w);
   if (map && map.fitBounds) {
     map.fitBounds([[s, w], [n, e]], { padding: [40, 40] });
@@ -571,11 +557,13 @@ async function renderMesh(positionsBuf, indicesBuf) {
 
 // ---- wire up ----------------------------------------------------------
 document.addEventListener('DOMContentLoaded', function () {
+  applyLayoutMode();
+  window.addEventListener('resize', applyLayoutMode);
   initMap();
   openSidebar();   // start expanded; no-op on desktop, shows the form first on mobile
   $('draw-btn').addEventListener('click', function () {
-    startDrawing();
-    closeSidebar();   // no-op on desktop; reveals the map to drag on mobile
+    placeBox();
+    closeSidebar();   // no-op on desktop; reveals the map for adjusting on mobile
   });
   $('pin-btn').addEventListener('click', function () {
     setPinMode(activeTool !== 'pin');

@@ -140,6 +140,13 @@
       background: #fff; border: 2.5px solid var(--accent); border-radius: 4px;
       box-shadow: 0 1px 3px rgba(0,0,0,0.35); cursor: grab;
     }
+    /* center move-the-box handle */
+    .move-handle {
+      background: var(--accent); color: #fff; border: 2px solid #fff;
+      border-radius: 50%; box-shadow: 0 1px 4px rgba(0,0,0,0.4);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 15px; line-height: 1; cursor: grab;
+    }
     /* pin-hole markers */
     .pin-marker {
       background: var(--accent); border: 2.5px solid #fff; border-radius: 50%;
@@ -148,26 +155,28 @@
     button.secondary.active-tool { background: #f7ede4; box-shadow: inset 0 0 0 1px var(--accent); }
     button.secondary:disabled { color: #b8b2a6; border-color: #d8d2c6; cursor: default; background: #fff; }
 
-    /* ---- mobile: sidebar becomes a Material-style temporary drawer ---- */
-    @media (max-width: 720px) {
-      body { overflow: hidden; }
-      #sidebar {
-        position: fixed; top: 0; left: 0; bottom: 0; z-index: 20;
-        width: min(86vw, 340px); min-width: 0;
-        transform: translateX(-100%);
-        transition: transform 0.25s ease;
-        box-shadow: 2px 0 24px rgba(0,0,0,0.3);
-      }
-      #sidebar.open { transform: translateX(0); }
-      #sidebar-scrim.show { display: block; opacity: 1; }
-      #sidebar-close { display: block; }
-      #menu-btn { display: flex; }
-      /* preview/build overlays should sit above a stray open drawer too */
-      #preview-panel, #building-overlay { z-index: 25; }
-      /* the hamburger sits where Leaflet's zoom control normally is;
-         push the control down out of the way */
-      .leaflet-top.leaflet-left { margin-top: 64px; }
+    /* ---- mobile: sidebar becomes a Material-style temporary drawer ----
+       Applied via the `mobile` class on <body>, which app.js sets from a
+       matchMedia check (or a ?mobile=1 override for testing on desktop).
+       Keep every mobile rule under body.mobile — do NOT add an @media
+       block, or the CSS and the JS behaviors can disagree. */
+    body.mobile { overflow: hidden; }
+    body.mobile #sidebar {
+      position: fixed; top: 0; left: 0; bottom: 0; z-index: 20;
+      width: min(86vw, 340px); min-width: 0;
+      transform: translateX(-100%);
+      transition: transform 0.25s ease;
+      box-shadow: 2px 0 24px rgba(0,0,0,0.3);
     }
+    body.mobile #sidebar.open { transform: translateX(0); }
+    body.mobile #sidebar-scrim.show { display: block; opacity: 1; }
+    body.mobile #sidebar-close { display: block; }
+    body.mobile #menu-btn { display: flex; }
+    /* preview/build overlays should sit above a stray open drawer too */
+    body.mobile #preview-panel, body.mobile #building-overlay { z-index: 25; }
+    /* the hamburger sits where Leaflet's zoom control normally is;
+       push the control down out of the way */
+    body.mobile .leaflet-top.leaflet-left { margin-top: 64px; }
   </style>
 </head>
 <body>
@@ -180,7 +189,7 @@
       <button id="sidebar-close" type="button" aria-label="Close menu">&times;</button>
     </div>
 
-    <button id="draw-btn" class="secondary" type="button">DRAW BOX</button>
+    <button id="draw-btn" class="secondary" type="button">PLACE BOX</button>
     <button id="pin-btn" class="secondary" type="button" disabled>ADD PIN HOLES</button>
     <div id="pin-status" class="hint" style="margin:-8px 0 12px"></div>
     <div id="err" class="msg error"></div>
@@ -319,8 +328,8 @@
         "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
     } }
   </script>
-  <script src="topocore.js?v=7"></script>
-  <script src="elevation.js?v=7"></script>
-  <script type="module" src="app.js?v=7"></script>
+  <script src="topocore.js?v=9"></script>
+  <script src="elevation.js?v=9"></script>
+  <script type="module" src="app.js?v=9"></script>
 </body>
 </html>
