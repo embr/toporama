@@ -122,6 +122,11 @@ function startDrawing() {
   var s = { start: null, pointerId: null };
   s.onDown = function (e) {
     if (s.pointerId !== null) return;   // ignore a second finger mid-drag
+    // Don't hijack taps on Leaflet's own UI (zoom +/-, attribution, etc).
+    // Leaflet's controls stop its *own* mouse/touch handling from leaking
+    // through them, but that doesn't cover this listener — without this
+    // check, touching the zoom button also started a (zero-movement) box.
+    if (e.target.closest('.leaflet-control')) return;
     s.pointerId = e.pointerId;
     s.start = map.mouseEventToLatLng(e);
     try { c.setPointerCapture(e.pointerId); } catch (err) {}
