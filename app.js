@@ -243,9 +243,9 @@ function finishBox(n, s, e, w) {
   updateHeight(); maybeEnableBuild();
   log('box finished:', bounds);
   if (sidebarIsDrawer())
-    // drawer is collapsed on mobile — pan/zoom/adjust freely, then use the
-    // toast button to bring the settings back when the box looks right
-    actionToast('Pan the map, drag corners or ✥ to adjust', 'BOX LOOKS GOOD ✓', openSidebar);
+    // drawer is collapsed on mobile — adjust freely, then use the toast
+    // button to bring the settings back when the box looks right
+    actionToast('Drag corners or ✥ to adjust', 'DONE ✓', openSidebar);
   else
     toast('drag a corner to resize, ✥ to move');
 }
@@ -562,8 +562,17 @@ document.addEventListener('DOMContentLoaded', function () {
   initMap();
   openSidebar();   // start expanded; no-op on desktop, shows the form first on mobile
   $('draw-btn').addEventListener('click', function () {
-    placeBox();
-    closeSidebar();   // no-op on desktop; reveals the map for adjusting on mobile
+    if (sidebarIsDrawer()) {
+      // mobile flow: 1) close the drawer so the user can pan/zoom to the
+      // area they want, 2) they tap the toast button to pop the box there,
+      // 3) adjust with handles, 4) DONE reopens the settings. The box is
+      // deliberately NOT placed yet — placing it before the user has
+      // navigated just makes them drag it across the world.
+      closeSidebar();
+      actionToast('Pan and zoom to your area', 'PLACE BOX HERE', placeBox);
+    } else {
+      placeBox();   // desktop: the map was visible all along, place now
+    }
   });
   $('pin-btn').addEventListener('click', function () {
     setPinMode(activeTool !== 'pin');
