@@ -89,6 +89,12 @@
       pointer-events: auto; display: flex; gap: 12px; align-items: center;
       white-space: normal; max-width: 90vw;
     }
+    /* on phones the side-by-side text+button squeezes the text into a tall
+       sliver — stack instead: message on top, button below */
+    body.mobile #toast.action {
+      flex-direction: column; gap: 8px; text-align: center;
+      font-size: 12px; padding: 9px 14px; width: max-content;
+    }
     .toast-btn {
       background: var(--accent); color: #fff; border: none; border-radius: 6px;
       padding: 8px 14px; font-size: 12px; font-weight: 700; letter-spacing: 0.04em;
@@ -328,8 +334,8 @@
         "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
     } }
   </script>
-  <script src="topocore.js?v=10"></script>
-  <script src="elevation.js?v=10"></script>
-  <script type="module" src="app.js?v=10"></script>
+  <script src="topocore.js?v=11"></script>
+  <script src="elevation.js?v=11"></script>
+  <script type="module" src="app.js?v=11"></script>
 </body>
 </html>
