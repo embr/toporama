@@ -28,8 +28,30 @@ var activeTool = null;         // null | 'pin'  (drawing has its own state)
 // ---- small helpers ----------------------------------------------------
 function $(id) { return document.getElementById(id); }
 function toast(msg, ms) {
-  var el = $('toast'); el.textContent = msg; el.style.display = 'block';
+  var el = $('toast');
+  el.classList.remove('action');
+  el.textContent = msg; el.style.display = 'block';
   clearTimeout(el._t); el._t = setTimeout(function () { el.style.display = 'none'; }, ms || 3500);
+}
+// A toast with a button that stays up until tapped. Used on mobile where
+// the drawer is out of the way and the user needs a way to say "done".
+function actionToast(msg, btnLabel, cb) {
+  var el = $('toast');
+  clearTimeout(el._t);
+  el.textContent = '';
+  var span = document.createElement('span');
+  span.textContent = msg;
+  var btn = document.createElement('button');
+  btn.type = 'button'; btn.className = 'toast-btn'; btn.textContent = btnLabel;
+  btn.addEventListener('click', function () { el.style.display = 'none'; cb(); });
+  el.appendChild(span); el.appendChild(btn);
+  el.classList.add('action');
+  el.style.display = 'flex';
+}
+// true when the sidebar is in overlay-drawer mode (the mobile breakpoint) —
+// read from the CSS itself so there's no duplicated breakpoint constant.
+function sidebarIsDrawer() {
+  return getComputedStyle($('sidebar')).position === 'fixed';
 }
 function showError(msg) { var e = $('err'); e.textContent = msg; e.style.display = 'block'; }
 function clearError() { $('err').style.display = 'none'; }
@@ -233,7 +255,12 @@ function finishBox(n, s, e, w) {
   $('pin-btn').disabled = false;
   updateHeight(); maybeEnableBuild();
   log('box finished:', bounds);
-  toast('drag a corner to fine-tune the box');
+  if (sidebarIsDrawer())
+    // drawer is collapsed on mobile after drawing — give the user an
+    // explicit "done" button that brings the settings back
+    actionToast('Drag corners to adjust', 'BOX LOOKS GOOD ✓', openSidebar);
+  else
+    toast('drag a corner to fine-tune the box');
 }
 
 // ---- pin-hole tool ------------------------------------------------------
@@ -381,8 +408,7 @@ function buildModelConfig() {
   if (pinLocs.length) {
     model.pin_holes = {
       locations: pinLocs,
-      diameter_mm: numOrNull('pin_diameter_mm') || 2.0,
-      depth_mm: numOrNull('pin_depth_mm') || 5.0
+      diameter_mm: numOrNull('pin_diameter_mm') || 2.0
     };
   }
   return model;
@@ -474,7 +500,7 @@ function showPreview(d) {
   if (d.resolution) add('tile resolution (m)', '~' + d.resolution.median + ' (zoom ' + d.zoom + ')');
   if (d.model.pin_holes)
     add('pin holes', d.model.pin_holes.locations.length + ' × ø' +
-        d.model.pin_holes.diameter_mm + ' mm, ' + d.model.pin_holes.depth_mm + ' mm deep');
+        d.model.pin_holes.diameter_mm + ' mm, cut through');
   if (d.resolution && d.resolution.median > 2 * d.grid_spacing_m)
     add('note', 'terrain tiles are coarser than the grid here — extra points cannot add detail');
   meta.appendChild(dl2);

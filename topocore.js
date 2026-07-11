@@ -582,42 +582,110 @@
     return { xyScale: xyScale, zScale: zScale, zDistortion: zDistortion };
   }
 
-  // Carve blind pin holes into the (already model-scale) top heightfield.
-  // Each hole is a flat-floored depression: every grid vertex within
-  // radius drops to (surface at pin) - depth. Because the bottom shell is
-  // derived FROM the top (makeBottom projects it down), depressing the top
-  // keeps the solid watertight for free — no CSG needed. The hole's wall
-  // slope is set by grid spacing, so denser grids (higher max_points) give
-  // crisper holes. If the grid is too coarse for any vertex to fall inside
-  // the radius, the nearest vertex is lowered so a hole always appears.
-  // Floors are clamped to the grid's lowest terrain z so a hole in a valley
-  // can't punch below the model base.
-  function carvePinHoles(pts, m, n, holes, xyScale) {
-    var N = m * n, i, radius = holes.diameter_mm / 2000 /* mm -> m */;
-    var depth = holes.depth_mm / 1000;
-    var zFloorMin = Infinity;
-    for (i = 0; i < N; i++) if (pts[i * 3 + 2] < zFloorMin) zFloorMin = pts[i * 3 + 2];
-    holes.locations.forEach(function (loc) {
+  // Cut through-hole pin holes: full cylinders removed from the top
+  // surface through the bottom shell, so a physical map pin passes clean
+  // through the crust (the model is an open shell underneath, so puncturing
+  // it gives an unobstructed hole of any pin length).
+  //
+  // The top and bottom meshes share grid topology (bottom = the top's faces
+  // flipped, vertices projected down), which makes a CSG-free cut possible:
+  // remove the SAME grid cells from both, then stitch a vertical wall
+  // between the top and bottom boundary rings of the opening. Every removed
+  // boundary edge gains exactly one wall triangle on top and one on bottom,
+  // so edge counts stay at 2 and the solid stays watertight.
+  //
+  // The hole outline is the union of grid cells whose center lies within
+  // the radius (at minimum the cell containing the pin), so it's a
+  // staircase approximation of a circle — denser grids (higher max_points)
+  // give rounder holes; at coarse grids it degrades to a square hole, which
+  // still holds a pin fine. Cells on the padded border ring are never
+  // removed so the outer side walls are undisturbed.
+  function cutPinHoles(top, bottom, m, n, holes, xyScale) {
+    var rows = m + 2, cols = n + 2;
+    var cellsX = cols - 1, cellsY = rows - 1;
+    var radius = holes.diameter_mm / 2000;   // mm -> model metres
+    var tv = top.vertices;
+    var removed = new Uint8Array(cellsY * cellsX);
+    var centers = holes.locations.map(function (loc) {
       var p = project(loc[0], loc[1]);
-      var px = p[0] * xyScale, py = p[1] * xyScale;
-      // surface height at the pin = z of the nearest grid vertex
-      var best = -1, bestD2 = Infinity;
-      for (i = 0; i < N; i++) {
-        var dx = pts[i * 3] - px, dy = pts[i * 3 + 1] - py;
-        var d2 = dx * dx + dy * dy;
-        if (d2 < bestD2) { bestD2 = d2; best = i; }
-      }
-      var floor = Math.max(pts[best * 3 + 2] - depth, zFloorMin);
-      var hit = 0;
-      for (i = 0; i < N; i++) {
-        var ddx = pts[i * 3] - px, ddy = pts[i * 3 + 1] - py;
-        if (ddx * ddx + ddy * ddy <= radius * radius) {
-          if (pts[i * 3 + 2] > floor) pts[i * 3 + 2] = floor;
-          hit++;
+      return [p[0] * xyScale, p[1] * xyScale];
+    });
+
+    function cellCenter(r, c) {
+      var v00 = (r * cols + c) * 3, v11 = ((r + 1) * cols + c + 1) * 3;
+      return [(tv[v00] + tv[v11]) / 2, (tv[v00 + 1] + tv[v11 + 1]) / 2];
+    }
+
+    centers.forEach(function (pc) {
+      var nearest = -1, nearestD2 = Infinity;
+      // interior cells only: leave the border ring for the outer walls
+      for (var r = 1; r < cellsY - 1; r++) {
+        for (var c = 1; c < cellsX - 1; c++) {
+          var cc = cellCenter(r, c);
+          var dx = cc[0] - pc[0], dy = cc[1] - pc[1], d2 = dx * dx + dy * dy;
+          if (d2 <= radius * radius) removed[r * cellsX + c] = 1;
+          if (d2 < nearestD2) { nearestD2 = d2; nearest = r * cellsX + c; }
         }
       }
-      if (!hit && pts[best * 3 + 2] > floor) pts[best * 3 + 2] = floor;
+      if (nearest >= 0) removed[nearest] = 1;   // grid coarser than the hole
     });
+
+    // filter both face lists (cell k -> triangles 2k, 2k+1 in grid order;
+    // bottom.faces is the flipped copy in the same order)
+    function keepFaces(faces) {
+      var kept = [], nCells = cellsY * cellsX;
+      for (var k = 0; k < nCells; k++) {
+        if (removed[k]) continue;
+        for (var j = 0; j < 6; j++) kept.push(faces[k * 6 + j]);
+      }
+      return new Int32Array(kept);
+    }
+
+    // wall quads along the boundary of the removed region
+    var wallVerts = [], wallFaces = [], bv = bottom.vertices;
+    function nearestHoleCenter(x, y) {
+      var best = centers[0], bd = Infinity;
+      centers.forEach(function (pc) {
+        var d = (pc[0] - x) * (pc[0] - x) + (pc[1] - y) * (pc[1] - y);
+        if (d < bd) { bd = d; best = pc; }
+      });
+      return best;
+    }
+    function addWall(a, b) {          // a,b: padded-grid vertex indices
+      var i0 = wallVerts.length / 3;
+      // 4 verts: topA, topB, bottomB, bottomA
+      [tv, tv, bv, bv].forEach(function (src, q) {
+        var vi = (q === 0 || q === 3) ? a : b;
+        wallVerts.push(src[vi * 3], src[vi * 3 + 1], src[vi * 3 + 2]);
+      });
+      // orient so the wall faces the hole axis (into the opening)
+      var ax = wallVerts[i0 * 3], ay = wallVerts[i0 * 3 + 1];
+      var bx = wallVerts[(i0 + 1) * 3], by = wallVerts[(i0 + 1) * 3 + 1];
+      var pc = nearestHoleCenter((ax + bx) / 2, (ay + by) / 2);
+      // horizontal normal of tri (topA, topB, *) is perpendicular to a->b
+      var nx = -(by - ay), ny = bx - ax;
+      var flip = nx * (pc[0] - (ax + bx) / 2) + ny * (pc[1] - (ay + by) / 2) < 0;
+      if (flip) wallFaces.push(i0 + 1, i0, i0 + 3, i0 + 1, i0 + 3, i0 + 2);
+      else wallFaces.push(i0, i0 + 1, i0 + 2, i0, i0 + 2, i0 + 3);
+    }
+    for (var r = 0; r < cellsY; r++) {
+      for (var c = 0; c < cellsX; c++) {
+        if (!removed[r * cellsX + c]) continue;
+        var v00 = r * cols + c, v01 = v00 + 1, v10 = v00 + cols, v11 = v10 + 1;
+        if (r === 0 || !removed[(r - 1) * cellsX + c]) addWall(v00, v01);
+        if (r === cellsY - 1 || !removed[(r + 1) * cellsX + c]) addWall(v10, v11);
+        if (c === 0 || !removed[r * cellsX + c - 1]) addWall(v00, v10);
+        if (c === cellsX - 1 || !removed[r * cellsX + c + 1]) addWall(v01, v11);
+      }
+    }
+
+    return {
+      top: new Mesh(top.vertices, keepFaces(top.faces)),
+      bottom: new Mesh(bottom.vertices, keepFaces(bottom.faces)),
+      walls: wallFaces.length
+        ? new Mesh(new Float64Array(wallVerts), new Int32Array(wallFaces))
+        : null
+    };
   }
 
   // Assemble the solid from an (m*n) grid of world-meter points
@@ -641,15 +709,21 @@
     info.z_scale = scale.zScale;
     info.output_z_distortion = scale.zDistortion;
 
-    if (model.pin_holes && model.pin_holes.locations &&
-        model.pin_holes.locations.length)
-      carvePinHoles(ptsWorld, m, n, model.pin_holes, scale.xyScale);
-
     var top = makeTop(ptsWorld, m, n, model.top_pad_width);
     var bottom = makeBottom(top, model.top_thickness, model.wall_thickness,
       (model.min_z_val === undefined ? null : model.min_z_val));
+    // outer sides come from the UNCUT perimeter; pin holes only ever remove
+    // interior cells, so cutting after this is safe
     var sides = makeSides(top, bottom);
-    var solid = unionMeshes([top, bottom, sides]);
+    var pieces = [top, bottom, sides];
+    if (model.pin_holes && model.pin_holes.locations &&
+        model.pin_holes.locations.length) {
+      var cut = cutPinHoles(top, bottom, m, n, model.pin_holes, scale.xyScale);
+      pieces = [cut.top, cut.bottom, sides];
+      if (cut.walls) pieces.push(cut.walls);
+      top = cut.top; bottom = cut.bottom;
+    }
+    var solid = unionMeshes(pieces);
     return { solid: solid, top: top, bottom: bottom, info: info };
   }
 

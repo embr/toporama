@@ -85,6 +85,16 @@
       border-radius: 8px; font-size: 13px; z-index: 5; display: none;
       pointer-events: none; white-space: nowrap;
     }
+    #toast.action {
+      pointer-events: auto; display: flex; gap: 12px; align-items: center;
+      white-space: normal; max-width: 90vw;
+    }
+    .toast-btn {
+      background: var(--accent); color: #fff; border: none; border-radius: 6px;
+      padding: 8px 14px; font-size: 12px; font-weight: 700; letter-spacing: 0.04em;
+      cursor: pointer; flex: none;
+    }
+    .toast-btn:hover { background: var(--accent-dark); }
     .msg { font-size: 12px; padding: 8px 10px; border-radius: 8px; margin-bottom: 12px; white-space: pre-wrap; display: none; }
     .msg.error { background: #fdecea; color: #b3261e; border: 1px solid #f5c6c0; }
     .msg.info { background: #eef4fb; color: #1c4e80; border: 1px solid #cfe0f2; }
@@ -241,15 +251,10 @@
           <input type="number" id="max_points" step="1" min="2" max="2000" value="500">
           <div class="hint">higher = more detail, bigger STL, more tiles fetched</div>
         </div>
-        <div class="row">
-          <div class="field">
-            <label for="pin_diameter_mm">Pin hole ø (mm)</label>
-            <input type="number" id="pin_diameter_mm" step="any" min="0.5" value="2">
-          </div>
-          <div class="field">
-            <label for="pin_depth_mm">Pin hole depth (mm)</label>
-            <input type="number" id="pin_depth_mm" step="any" min="1" value="5">
-          </div>
+        <div class="field">
+          <label for="pin_diameter_mm">Pin hole ø (mm)</label>
+          <input type="number" id="pin_diameter_mm" step="any" min="0.5" value="2">
+          <div class="hint">holes are cut clean through the shell</div>
         </div>
         <fieldset>
           <label><input type="checkbox" id="show_bathymetry"> Show bathymetry (sea-floor depth)</label>
@@ -314,8 +319,8 @@
         "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
     } }
   </script>
-  <script src="topocore.js?v=6"></script>
-  <script src="elevation.js?v=6"></script>
-  <script type="module" src="app.js?v=6"></script>
+  <script src="topocore.js?v=7"></script>
+  <script src="elevation.js?v=7"></script>
+  <script type="module" src="app.js?v=7"></script>
 </body>
 </html>
