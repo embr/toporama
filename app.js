@@ -83,16 +83,26 @@ function clearBox() {
   if (boxLayer) { map.removeLayer(boxLayer); boxLayer = null; }
 }
 
-// ---- click-and-drag box drawing ---------------------------------------
+// ---- click-and-drag (or touch-and-drag) box drawing --------------------
+// This uses Pointer Events, not Leaflet's mouse events. Mouse and touch
+// input both fire pointerdown/pointermove/pointerup, so one code path
+// drives both a mouse drag and a finger drag. A prior version listened for
+// plain 'mousedown'/'mousemove'/'mouseup' via map.on(...), which works for
+// a mouse but is silently broken on touchscreens: a touch drag never fires
+// a native 'mousemove' event, so the box never updated and every touch
+// looked like a no-op tap.
 function cancelDrawSession() {
   if (!drawSession) return;
-  map.off('mousedown', drawSession.onDown);
-  map.off('mousemove', drawSession.onMove);
-  map.off('mouseup', drawSession.onUp);
+  var c = map.getContainer();
+  c.removeEventListener('pointerdown', drawSession.onDown);
+  c.removeEventListener('pointermove', drawSession.onMove);
+  c.removeEventListener('pointerup', drawSession.onUp);
+  c.removeEventListener('pointercancel', drawSession.onUp);
+  c.style.touchAction = '';
   drawSession = null;
   drawing = false;
   if (map.dragging) map.dragging.enable();
-  var c = map.getContainer(); if (c) c.style.cursor = '';
+  c.style.cursor = '';
 }
 
 function startDrawing() {
@@ -101,40 +111,54 @@ function startDrawing() {
   clearBox();
   bounds = null; maybeEnableBuild();
   drawing = true;
-  map.getContainer().style.cursor = 'crosshair';
+  var c = map.getContainer();
+  c.style.cursor = 'crosshair';
+  // Without this the browser treats a finger drag as a page-pan/scroll
+  // gesture and never delivers pointermove events to us.
+  c.style.touchAction = 'none';
   if (map.dragging) map.dragging.disable();   // don't pan while drawing
-  toast('click and drag to select a region');
+  toast('drag (finger or mouse) to select a region');
 
-  var s = { start: null };
+  var s = { start: null, pointerId: null };
   s.onDown = function (e) {
-    s.start = e.latlng;
-    map.on('mousemove', s.onMove);
-    map.on('mouseup', s.onUp);
+    if (s.pointerId !== null) return;   // ignore a second finger mid-drag
+    s.pointerId = e.pointerId;
+    s.start = map.mouseEventToLatLng(e);
+    try { c.setPointerCapture(e.pointerId); } catch (err) {}
+    e.preventDefault();
   };
   s.onMove = function (e) {
-    if (!s.start) return;
-    var a = s.start, b = e.latlng;
+    if (s.start === null || e.pointerId !== s.pointerId) return;
+    var a = s.start, b = map.mouseEventToLatLng(e);
     setBox(Math.max(a.lat, b.lat), Math.min(a.lat, b.lat),
            Math.max(a.lng, b.lng), Math.min(a.lng, b.lng));
+    e.preventDefault();
   };
   s.onUp = function (e) {
-    map.off('mousemove', s.onMove);
-    map.off('mouseup', s.onUp);
-    var a = s.start, b = e.latlng;
-    s.start = null;
+    if (s.start === null || e.pointerId !== s.pointerId) return;
+    var a = s.start, b = map.mouseEventToLatLng(e);
+    s.start = null; s.pointerId = null;
+    try { c.releasePointerCapture(e.pointerId); } catch (err) {}
     var tiny = Math.abs(b.lat - a.lat) < 1e-4 && Math.abs(b.lng - a.lng) < 1e-4;
-    if (tiny) { clearBox(); return; }   // a click, not a drag: stay armed
-    map.off('mousedown', s.onDown);
+    if (tiny) { clearBox(); return; }   // a tap, not a drag: stay armed
+    c.removeEventListener('pointerdown', s.onDown);
+    c.removeEventListener('pointermove', s.onMove);
+    c.removeEventListener('pointerup', s.onUp);
+    c.removeEventListener('pointercancel', s.onUp);
     drawSession = null;
     drawing = false;
     if (map.dragging) map.dragging.enable();
-    map.getContainer().style.cursor = '';
+    c.style.cursor = '';
+    c.style.touchAction = '';
     finishBox(Math.max(a.lat, b.lat), Math.min(a.lat, b.lat),
               Math.max(a.lng, b.lng), Math.min(a.lng, b.lng));
   };
 
   drawSession = s;
-  map.on('mousedown', s.onDown);
+  c.addEventListener('pointerdown', s.onDown);
+  c.addEventListener('pointermove', s.onMove);
+  c.addEventListener('pointerup', s.onUp);
+  c.addEventListener('pointercancel', s.onUp);
 }
 
 function finishBox(n, s, e, w) {
@@ -393,6 +417,7 @@ async function renderMesh(positionsBuf, indicesBuf) {
 // ---- wire up ----------------------------------------------------------
 document.addEventListener('DOMContentLoaded', function () {
   initMap();
+  openSidebar();   // start expanded; no-op on desktop, shows the form first on mobile
   $('draw-btn').addEventListener('click', function () {
     startDrawing();
     closeSidebar();   // no-op on desktop; reveals the map to drag on mobile
