@@ -171,10 +171,53 @@
         if (!showBathymetry && e < 0) e = 0;
         elevs[p] = e;
       }
+      // grid spacing on the ground, for the despike threshold
+      var midLat = 0.5 * (north + south);
+      var widthM = Math.abs(east - west) * (Math.PI / 180) * 6378137 *
+        Math.cos(midLat * Math.PI / 180);
+      despike(elevs, m, n, Math.max(500, 4 * widthM / Math.max(n - 1, 1)));
       var res = groundResolution(0.5 * (north + south), z);
       var rr = Math.round(res * 10) / 10;
       return { elevs: elevs, resolution: { min: rr, median: rr, max: rr }, zoom: z };
     });
+  }
+
+  // The terrarium tiles occasionally contain corrupt pixels (decoded
+  // "elevations" of many km, appearing as huge spikes on the mesh). Two
+  // defenses: clamp to Earth's plausible range, then replace any point
+  // that differs from the median of its 8 neighbours by more than
+  // `thresh` metres with that median. Two passes erode small clusters of
+  // bad pixels, while real terrain (even cliffs) passes through: thresh
+  // is at least 500 m per grid step, far steeper than any real slope at
+  // the grid resolutions we use.
+  function despike(elevs, m, n, thresh) {
+    for (var i = 0; i < m * n; i++) {
+      if (elevs[i] > 8900) elevs[i] = 8900;
+      else if (elevs[i] < -450) elevs[i] = -450;
+    }
+    for (var pass = 0; pass < 2; pass++) {
+      var src = Float64Array.from(elevs);
+      for (var r = 0; r < m; r++) {
+        for (var c = 0; c < n; c++) {
+          // 5x5 neighbourhood median: robust against corrupt blobs a few
+          // pixels wide, which slip through a 3x3 (their bad values can
+          // dominate a small window, especially at the grid edge)
+          var nb = [];
+          for (var dr = -2; dr <= 2; dr++) {
+            for (var dc = -2; dc <= 2; dc++) {
+              if (!dr && !dc) continue;
+              var rr2 = r + dr, cc = c + dc;
+              if (rr2 < 0 || rr2 >= m || cc < 0 || cc >= n) continue;
+              nb.push(src[rr2 * n + cc]);
+            }
+          }
+          nb.sort(function (a, b) { return a - b; });
+          var med = nb[nb.length >> 1];
+          var i2 = r * n + c;
+          if (Math.abs(src[i2] - med) > thresh) elevs[i2] = med;
+        }
+      }
+    }
   }
 
   var Elev = {

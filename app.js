@@ -417,6 +417,41 @@ function setBuilding(on, label) {
 }
 function setProgress(frac) { $('building-bar').style.width = Math.round(frac * 100) + '%'; }
 
+// last successful build's inputs, kept so the preview's tuning sliders can
+// re-mesh with a different distortion/exponent without re-fetching tiles
+var lastBuild = null;
+
+function remesh(fields) {
+  if (!lastBuild) return;
+  var model2 = {};
+  for (var k in lastBuild.model) model2[k] = lastBuild.model[k];
+  for (k in fields) model2[k] = fields[k];
+  // a distortion override replaces thickness mode (they're exclusive ways
+  // of setting the z scale, and the slider works in distortion terms)
+  if (fields.output_z_distortion !== undefined) {
+    delete model2.output_z_meters;
+    model2.output_z_distortion = fields.output_z_distortion;
+  }
+  lastBuild.model = model2;
+  var world2 = lastBuild.world.slice();
+  var sum = $('preview-summary');
+  sum.textContent = 're-meshing…';
+  var worker = new Worker('worker.js');
+  worker.onmessage = function (ev) {
+    var d = ev.data;
+    worker.terminate();
+    if (!d.ok) { showError('Re-mesh failed: ' + d.error); return; }
+    d.grid_spacing_m = lastBuild.gridSpacing;
+    d.resolution = lastBuild.resolution;
+    d.zoom = lastBuild.zoom;
+    d.model = model2;
+    showPreview(d);
+  };
+  worker.onerror = function (er) { showError('Worker error: ' + er.message); };
+  worker.postMessage({ model: model2, world: world2.buffer,
+    m: lastBuild.m, n: lastBuild.n }, [world2.buffer]);
+}
+
 function doBuild() {
   clearError();
   var model;
@@ -445,6 +480,15 @@ function doBuild() {
     var pMax = Topo.project(model.east, model.north);
     var midLat = 0.5 * (model.north + model.south);
     var gridSpacing = (pMax[0] - pMin[0]) / (grid.n - 1) * Math.cos(midLat * Math.PI / 180);
+
+    // keep everything the preview sliders need to re-mesh WITHOUT
+    // re-fetching elevation tiles (world is copied — the original buffer
+    // is transferred to the worker below and becomes unusable here)
+    lastBuild = {
+      world: world.slice(), m: grid.m, n: grid.n,
+      gridSpacing: gridSpacing, resolution: elev.resolution, zoom: elev.zoom,
+      model: model
+    };
 
     var worker = new Worker('worker.js');
     worker.onmessage = function (ev) {
@@ -480,6 +524,48 @@ function showPreview(d) {
 
   var meta = $('preview-meta');
   meta.innerHTML = '';
+
+  // tuning sliders: instant approximate feedback while dragging (the mesh
+  // is z-scaled in the viewer), exact re-mesh from the cached elevation
+  // grid on release — no tile re-download either way
+  if (lastBuild) {
+    var dist0 = Math.round((d.info && d.info.output_z_distortion ||
+      d.model.output_z_distortion || 2) * 100) / 100;
+    var exp0 = d.model.distortion_exponent || 1;
+    var tune = document.createElement('div');
+    tune.className = 'tune';
+    tune.innerHTML =
+      '<label>elevation distortion <b id="tune-dist-val">' + dist0 + '</b>' +
+      '<input type="range" id="tune-dist" min="0.25" max="6" step="0.05" value="' + dist0 + '"></label>' +
+      '<label>peak-flattening exponent <b id="tune-exp-val">' + exp0 + '</b>' +
+      '<input type="range" id="tune-exp" min="0.3" max="2" step="0.05" value="' + exp0 + '"></label>';
+    meta.appendChild(tune);
+    var sd = tune.querySelector('#tune-dist'), se = tune.querySelector('#tune-exp');
+    sd.addEventListener('input', function () {
+      $('tune-dist-val').textContent = sd.value;
+      // live approximation: scale the rendered mesh in z (bases/walls
+      // stretch a little too — the release re-mesh makes it exact)
+      if (viewerState && viewerState.mesh)
+        viewerState.mesh.scale.z = parseFloat(sd.value) / dist0;
+    });
+    sd.addEventListener('change', function () {
+      var v = parseFloat(sd.value);
+      $('elevation_distortion').value = v;      // keep the form in sync
+      $('elevation_distortion').disabled = false;
+      $('model_thickness_cm').value = '';
+      $('model_thickness_cm').disabled = false;
+      remesh({ output_z_distortion: v });
+    });
+    se.addEventListener('input', function () {
+      $('tune-exp-val').textContent = se.value;
+    });
+    se.addEventListener('change', function () {
+      var v = parseFloat(se.value);
+      $('distortion_exponent').value = (v === 1 ? '' : v);
+      remesh({ distortion_exponent: v });
+    });
+  }
+
   d.checks.forEach(function (c) {
     var row = document.createElement('div'); row.className = 'check';
     var lv = document.createElement('span'); lv.className = 'level ' + c.level; lv.textContent = c.level;
@@ -561,7 +647,7 @@ async function renderMesh(positionsBuf, indicesBuf) {
     controls.update();
     renderer.render(scene, camera);
   }
-  viewerState = { renderer: renderer, raf: 0 };
+  viewerState = { renderer: renderer, raf: 0, mesh: mesh };
   animate();
 }
 
@@ -569,6 +655,11 @@ async function renderMesh(positionsBuf, indicesBuf) {
 document.addEventListener('DOMContentLoaded', function () {
   applyLayoutMode();
   window.addEventListener('resize', applyLayoutMode);
+  // show which build this page is actually running (reads the cache-bust
+  // version off our own script tag) — tells cached pages apart at a glance
+  var vs = document.querySelector('script[src^="app.js"]');
+  var vm = vs && vs.getAttribute('src').match(/v=(\d+)/);
+  if (vm) $('build-ver').textContent = '· build ' + vm[1];
   initMap();
   openSidebar();   // start expanded; no-op on desktop, shows the form first on mobile
   $('draw-btn').addEventListener('click', function () {

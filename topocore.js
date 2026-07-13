@@ -594,40 +594,182 @@
   // boundary edge gains exactly one wall triangle on top and one on bottom,
   // so edge counts stay at 2 and the solid stays watertight.
   //
-  // The hole outline is the union of grid cells whose center lies within
-  // the radius (at minimum the cell containing the pin), so it's a
-  // staircase approximation of a circle — denser grids (higher max_points)
-  // give rounder holes; at coarse grids it degrades to a square hole, which
-  // still holds a pin fine. Cells on the padded border ring are never
-  // removed so the outer side walls are undisturbed.
+  // The hole cross-section is a TRUE CIRCLE whose smoothness is set in
+  // absolute millimetres, independent of the terrain grid: grid cells
+  // around the pin are removed with a safety margin, then a ring of
+  // vertices (chord length ~HOLE_CHORD_MM) is inserted at the exact hole
+  // radius and stitched to the staircase boundary of the removed cells
+  // with an annulus of triangles (top and bottom), plus a cylindrical
+  // wall between the two rings. Ring z values are bilinearly sampled from
+  // the surrounding surface, so the hole rim follows the terrain.
+  //
+  // Watertightness bookkeeping: every kept-mesh boundary edge gets exactly
+  // one annulus triangle (top and bottom), every ring edge is shared by
+  // annulus + wall, and every wall vertical edge is shared by adjacent
+  // wall quads — all edge counts stay at 2.
+  //
+  // Holes whose expanded cell footprint would leave the grid interior or
+  // overlap another hole are skipped (reported via the returned `skipped`).
+  var HOLE_CHORD_MM = 0.35;   // ring segment length: sets circularity in mm
+
   function cutPinHoles(top, bottom, m, n, holes, xyScale) {
     var rows = m + 2, cols = n + 2;
     var cellsX = cols - 1, cellsY = rows - 1;
     var radius = holes.diameter_mm / 2000;   // mm -> model metres
-    var tv = top.vertices;
-    var removed = new Uint8Array(cellsY * cellsX);
-    var centers = holes.locations.map(function (loc) {
-      var p = project(loc[0], loc[1]);
-      return [p[0] * xyScale, p[1] * xyScale];
-    });
+    var segs = Math.max(16, Math.min(64,
+      Math.round(Math.PI * holes.diameter_mm / HOLE_CHORD_MM)));
+    var tv = top.vertices, bv = bottom.vertices;
+    var removedAll = new Uint8Array(cellsY * cellsX);
+    var extras = [], skipped = 0;
 
-    function cellCenter(r, c) {
-      var v00 = (r * cols + c) * 3, v11 = ((r + 1) * cols + c + 1) * 3;
-      return [(tv[v00] + tv[v11]) / 2, (tv[v00 + 1] + tv[v11 + 1]) / 2];
+    // bilinear z on a padded grid mesh (x ascends with col, y DESCENDS
+    // with row; row 1 / col 1 are the first unpadded coordinates)
+    function gridZ(verts, x, y) {
+      var lo = 1, hi = cols - 2, c, r;
+      while (hi - lo > 1) { c = (lo + hi) >> 1;
+        if (verts[(cols + c) * 3] <= x) lo = c; else hi = c; }
+      c = lo;
+      lo = 1; hi = rows - 2;
+      while (hi - lo > 1) { r = (lo + hi) >> 1;
+        if (verts[(r * cols + 1) * 3 + 1] >= y) lo = r; else hi = r; }
+      r = lo;
+      var i00 = (r * cols + c) * 3, i01 = i00 + 3;
+      var i10 = ((r + 1) * cols + c) * 3, i11 = i10 + 3;
+      var x0 = verts[i00], x1 = verts[i01], y0 = verts[i00 + 1], y1 = verts[i10 + 1];
+      var fx = x1 === x0 ? 0 : (x - x0) / (x1 - x0);
+      var fy = y1 === y0 ? 0 : (y - y0) / (y1 - y0);
+      fx = Math.max(0, Math.min(1, fx)); fy = Math.max(0, Math.min(1, fy));
+      return (verts[i00 + 2] * (1 - fx) + verts[i01 + 2] * fx) * (1 - fy) +
+             (verts[i10 + 2] * (1 - fx) + verts[i11 + 2] * fx) * fy;
     }
 
-    centers.forEach(function (pc) {
-      var nearest = -1, nearestD2 = Infinity;
-      // interior cells only: leave the border ring for the outer walls
-      for (var r = 1; r < cellsY - 1; r++) {
+    holes.locations.forEach(function (loc) {
+      var p = project(loc[0], loc[1]);
+      var px = p[0] * xyScale, py = p[1] * xyScale;
+
+      // local grid spacing -> removal margin that guarantees the circle
+      // lies strictly inside the removed cells
+      var sx = tv[(cols + 2) * 3] - tv[(cols + 1) * 3];
+      var sy = Math.abs(tv[(2 * cols + 1) * 3 + 1] - tv[(cols + 1) * 3 + 1]);
+      var margin = 0.71 * Math.max(sx, sy);
+      var rOut = radius + margin, rOut2 = rOut * rOut;
+
+      // collect this hole's cells; bail out (skip) if any falls outside
+      // the interior or into another hole's footprint
+      var cells = [], ok = true;
+      var cMin = Math.max(1, Math.floor((px - rOut - tv[(cols + 1) * 3]) / sx));
+      for (var r = 1; r < cellsY - 1 && ok; r++) {
         for (var c = 1; c < cellsX - 1; c++) {
-          var cc = cellCenter(r, c);
-          var dx = cc[0] - pc[0], dy = cc[1] - pc[1], d2 = dx * dx + dy * dy;
-          if (d2 <= radius * radius) removed[r * cellsX + c] = 1;
-          if (d2 < nearestD2) { nearestD2 = d2; nearest = r * cellsX + c; }
+          var v00 = (r * cols + c) * 3, v11 = ((r + 1) * cols + c + 1) * 3;
+          var cx = (tv[v00] + tv[v11]) / 2, cy = (tv[v00 + 1] + tv[v11 + 1]) / 2;
+          var dx = cx - px, dy = cy - py;
+          if (dx * dx + dy * dy > rOut2) continue;
+          if (removedAll[r * cellsX + c]) { ok = false; break; }
+          cells.push(r * cellsX + c);
         }
       }
-      if (nearest >= 0) removed[nearest] = 1;   // grid coarser than the hole
+      // a hole hugging the box edge would need border cells -> reject if
+      // the circle isn't fully covered by collected cells (checked below
+      // via boundary distance), or if no cell qualified at all
+      if (!ok || !cells.length) { skipped++; return; }
+      cells.forEach(function (k) { removedAll[k] = 1; });
+
+      // boundary edges of this hole's cell set -> unique loop vertices
+      var isMine = {};
+      cells.forEach(function (k) { isMine[k] = 1; });
+      var loopSet = {}, minB2 = Infinity;
+      function edgeVerts(a, b) { loopSet[a] = 1; loopSet[b] = 1; }
+      cells.forEach(function (k) {
+        var r = (k / cellsX) | 0, c = k % cellsX;
+        var v00 = r * cols + c, v01 = v00 + 1, v10 = v00 + cols, v11 = v10 + 1;
+        if (!isMine[k - cellsX]) edgeVerts(v00, v01);
+        if (!isMine[k + cellsX]) edgeVerts(v10, v11);
+        if (!isMine[k - 1]) edgeVerts(v00, v10);
+        if (!isMine[k + 1]) edgeVerts(v01, v11);
+      });
+      var loop = Object.keys(loopSet).map(Number);
+      loop.forEach(function (vi) {
+        var dx = tv[vi * 3] - px, dy = tv[vi * 3 + 1] - py;
+        var d2 = dx * dx + dy * dy;
+        if (d2 < minB2) minB2 = d2;
+      });
+      // circle must be strictly inside the opening (can fail for a hole
+      // pressed against the box edge, where border cells were off-limits)
+      if (minB2 <= radius * radius) {
+        cells.forEach(function (k) { removedAll[k] = 0; });
+        skipped++; return;
+      }
+      // sort boundary vertices by angle around the pin (radius tiebreak)
+      loop.sort(function (a, b) {
+        var aa = Math.atan2(tv[a * 3 + 1] - py, tv[a * 3] - px);
+        var ab = Math.atan2(tv[b * 3 + 1] - py, tv[b * 3] - px);
+        if (aa !== ab) return aa - ab;
+        var ra = (tv[a * 3] - px) * (tv[a * 3] - px) + (tv[a * 3 + 1] - py) * (tv[a * 3 + 1] - py);
+        var rb = (tv[b * 3] - px) * (tv[b * 3] - px) + (tv[b * 3 + 1] - py) * (tv[b * 3 + 1] - py);
+        return ra - rb;
+      });
+
+      // hole-local mesh: outer loop verts (top+bottom copies) + ring verts
+      var hv = [], P = loop.length;
+      loop.forEach(function (vi) {           // 0..P-1: outer top
+        hv.push(tv[vi * 3], tv[vi * 3 + 1], tv[vi * 3 + 2]);
+      });
+      loop.forEach(function (vi) {           // P..2P-1: outer bottom
+        hv.push(bv[vi * 3], bv[vi * 3 + 1], bv[vi * 3 + 2]);
+      });
+      var ringT = [], ringB = [];
+      for (var k2 = 0; k2 < segs; k2++) {    // 2P..2P+S-1 top, then S bottom
+        var th = -Math.PI + (2 * Math.PI * k2) / segs;
+        var rx = px + radius * Math.cos(th), ry = py + radius * Math.sin(th);
+        ringT.push(hv.length / 3); hv.push(rx, ry, gridZ(tv, rx, ry));
+      }
+      for (k2 = 0; k2 < segs; k2++) {
+        var th2 = -Math.PI + (2 * Math.PI * k2) / segs;
+        var rx2 = px + radius * Math.cos(th2), ry2 = py + radius * Math.sin(th2);
+        ringB.push(hv.length / 3); hv.push(rx2, ry2, gridZ(bv, rx2, ry2));
+      }
+
+      // annulus triangulation: merge-walk outer loop and ring by angle.
+      // Both sequences ascend in angle, so advancing the outer produces
+      // (lastO, newO, lastI) and advancing the ring (newI, lastI, lastO),
+      // both counter-clockwise (facing up) for the top surface.
+      var hf = [];
+      function ringAngle(k) { return -Math.PI + (2 * Math.PI * k) / segs; }
+      function loopAngle(i) {
+        return Math.atan2(hv[i * 3 + 1] - py, hv[i * 3] - px);
+      }
+      function zipAnnulus(outerOf, innerOf, flip) {
+        var i = 0, j = 0;
+        var lastO = outerOf(P - 1), lastI = innerOf(segs - 1);
+        while (i < P || j < segs) {
+          var advOuter;
+          if (i >= P) advOuter = false;
+          else if (j >= segs) advOuter = true;
+          else advOuter = loopAngle(outerOf(i)) <= ringAngle(j);
+          if (advOuter) {
+            var nO = outerOf(i++);
+            if (flip) hf.push(nO, lastO, lastI); else hf.push(lastO, nO, lastI);
+            lastO = nO;
+          } else {
+            var nI = innerOf(j++);
+            if (flip) hf.push(lastI, nI, lastO); else hf.push(nI, lastI, lastO);
+            lastI = nI;
+          }
+        }
+      }
+      zipAnnulus(function (i) { return i; }, function (j) { return ringT[j]; }, false);
+      zipAnnulus(function (i) { return P + i; }, function (j) { return ringB[j]; }, true);
+
+      // cylindrical wall between the two rings, facing the hole axis
+      for (k2 = 0; k2 < segs; k2++) {
+        var a = ringT[k2], b = ringT[(k2 + 1) % segs];
+        var a2 = ringB[k2], b2 = ringB[(k2 + 1) % segs];
+        // ring ascends CCW seen from above; traversing the top edge a->b
+        // (ascending) gives inward-facing normals AND complements the
+        // annulus triangles' descending traversal of the same edges
+        hf.push(a, b, b2, a, b2, a2);
+      }
+      extras.push(new Mesh(new Float64Array(hv), new Int32Array(hf)));
     });
 
     // filter both face lists (cell k -> triangles 2k, 2k+1 in grid order;
@@ -635,56 +777,17 @@
     function keepFaces(faces) {
       var kept = [], nCells = cellsY * cellsX;
       for (var k = 0; k < nCells; k++) {
-        if (removed[k]) continue;
+        if (removedAll[k]) continue;
         for (var j = 0; j < 6; j++) kept.push(faces[k * 6 + j]);
       }
       return new Int32Array(kept);
     }
 
-    // wall quads along the boundary of the removed region
-    var wallVerts = [], wallFaces = [], bv = bottom.vertices;
-    function nearestHoleCenter(x, y) {
-      var best = centers[0], bd = Infinity;
-      centers.forEach(function (pc) {
-        var d = (pc[0] - x) * (pc[0] - x) + (pc[1] - y) * (pc[1] - y);
-        if (d < bd) { bd = d; best = pc; }
-      });
-      return best;
-    }
-    function addWall(a, b) {          // a,b: padded-grid vertex indices
-      var i0 = wallVerts.length / 3;
-      // 4 verts: topA, topB, bottomB, bottomA
-      [tv, tv, bv, bv].forEach(function (src, q) {
-        var vi = (q === 0 || q === 3) ? a : b;
-        wallVerts.push(src[vi * 3], src[vi * 3 + 1], src[vi * 3 + 2]);
-      });
-      // orient so the wall faces the hole axis (into the opening)
-      var ax = wallVerts[i0 * 3], ay = wallVerts[i0 * 3 + 1];
-      var bx = wallVerts[(i0 + 1) * 3], by = wallVerts[(i0 + 1) * 3 + 1];
-      var pc = nearestHoleCenter((ax + bx) / 2, (ay + by) / 2);
-      // horizontal normal of tri (topA, topB, *) is perpendicular to a->b
-      var nx = -(by - ay), ny = bx - ax;
-      var flip = nx * (pc[0] - (ax + bx) / 2) + ny * (pc[1] - (ay + by) / 2) < 0;
-      if (flip) wallFaces.push(i0 + 1, i0, i0 + 3, i0 + 1, i0 + 3, i0 + 2);
-      else wallFaces.push(i0, i0 + 1, i0 + 2, i0, i0 + 2, i0 + 3);
-    }
-    for (var r = 0; r < cellsY; r++) {
-      for (var c = 0; c < cellsX; c++) {
-        if (!removed[r * cellsX + c]) continue;
-        var v00 = r * cols + c, v01 = v00 + 1, v10 = v00 + cols, v11 = v10 + 1;
-        if (r === 0 || !removed[(r - 1) * cellsX + c]) addWall(v00, v01);
-        if (r === cellsY - 1 || !removed[(r + 1) * cellsX + c]) addWall(v10, v11);
-        if (c === 0 || !removed[r * cellsX + c - 1]) addWall(v00, v10);
-        if (c === cellsX - 1 || !removed[r * cellsX + c + 1]) addWall(v01, v11);
-      }
-    }
-
     return {
       top: new Mesh(top.vertices, keepFaces(top.faces)),
       bottom: new Mesh(bottom.vertices, keepFaces(bottom.faces)),
-      walls: wallFaces.length
-        ? new Mesh(new Float64Array(wallVerts), new Int32Array(wallFaces))
-        : null
+      extras: extras,
+      skipped: skipped
     };
   }
 
@@ -719,9 +822,10 @@
     if (model.pin_holes && model.pin_holes.locations &&
         model.pin_holes.locations.length) {
       var cut = cutPinHoles(top, bottom, m, n, model.pin_holes, scale.xyScale);
-      pieces = [cut.top, cut.bottom, sides];
-      if (cut.walls) pieces.push(cut.walls);
+      pieces = [cut.top, cut.bottom, sides].concat(cut.extras);
       top = cut.top; bottom = cut.bottom;
+      info.pin_holes_cut = model.pin_holes.locations.length - cut.skipped;
+      info.pin_holes_skipped = cut.skipped;
     }
     var solid = unionMeshes(pieces);
     return { solid: solid, top: top, bottom: bottom, info: info };

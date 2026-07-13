@@ -132,6 +132,10 @@
     #preview-meta dl { display: grid; grid-template-columns: max-content 1fr; gap: 3px 18px; font-size: 13px; margin-top: 14px; }
     #preview-meta dt { color: var(--muted); }
     #preview-meta dd { margin: 0; font-variant-numeric: tabular-nums; }
+    .tune { display: flex; gap: 24px; flex-wrap: wrap; margin: 2px 0 14px; }
+    .tune label { flex: 1; min-width: 220px; font-size: 12px; color: var(--muted); }
+    .tune label b { color: var(--ink); font-variant-numeric: tabular-nums; margin-left: 4px; }
+    .tune input[type=range] { width: 100%; accent-color: var(--accent); margin-top: 2px; }
     #building-overlay {
       position: absolute; inset: 0; background: rgba(250,247,242,0.85); z-index: 8;
       display: none; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
@@ -194,7 +198,7 @@
     <div id="sidebar-header">
       <div>
         <h1>TOPORAMA</h1>
-        <div class="subtitle">3D-printable raised relief maps · no key, no sign-up · runs in your browser</div>
+        <div class="subtitle">3D-printable raised relief maps · no key, no sign-up · runs in your browser <span id="build-ver"></span></div>
       </div>
       <button id="sidebar-close" type="button" aria-label="Close menu">&times;</button>
     </div>
@@ -338,8 +342,8 @@
         "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
     } }
   </script>
-  <script src="topocore.js?v=13"></script>
-  <script src="elevation.js?v=13"></script>
-  <script type="module" src="app.js?v=13"></script>
+  <script src="topocore.js?v=17"></script>
+  <script src="elevation.js?v=17"></script>
+  <script type="module" src="app.js?v=17"></script>
 </body>
 </html>
