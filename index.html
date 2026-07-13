@@ -47,7 +47,7 @@
        cover the map even though openSidebar() runs on page load. */
     .field { margin-bottom: 13px; }
     .field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; }
-    .field input[type=text], .field input[type=number] {
+    .field input[type=text], .field input[type=number], .field select {
       width: 100%; padding: 7px 9px; font-size: 14px;
       border: 1px solid var(--line); border-radius: 6px; background: #fff;
     }
@@ -104,6 +104,9 @@
     .msg { font-size: 12px; padding: 8px 10px; border-radius: 8px; margin-bottom: 12px; white-space: pre-wrap; display: none; }
     .msg.error { background: #fdecea; color: #b3261e; border: 1px solid #f5c6c0; }
     .msg.info { background: #eef4fb; color: #1c4e80; border: 1px solid #cfe0f2; }
+    /* while previewing, the sidebar form is inert - hide it and give the
+       preview the full window; Back to map restores it */
+    body.previewing #sidebar { display: none; }
     /* preview overlay */
     #preview-panel {
       position: absolute; inset: 0; background: var(--bg); z-index: 10;
@@ -286,19 +289,9 @@
 
       <details>
         <summary>Advanced options</summary>
-        <div class="field">
-          <label for="elevation_distortion">Elevation distortion</label>
-          <input type="number" id="elevation_distortion" step="any" min="0.01" placeholder="2">
-          <div class="hint">1.0 = true scale; defaults to 2 — tune it live on the preview sliders</div>
-        </div>
-        <div class="or-divider">— or —</div>
-        <div class="field">
-          <label for="model_thickness_cm">Thickness (cm)</label>
-          <input type="number" id="model_thickness_cm" step="any" min="0.5">
-          <div class="hint">distorts elevation so the model has this height</div>
-        </div>
+
         <fieldset>
-          <legend>Set box by coordinates</legend>
+          <legend>Location &amp; size</legend>
           <div class="row">
             <div class="field">
               <label for="box_north">North (lat)</label>
@@ -320,44 +313,86 @@
             </div>
           </div>
           <button type="button" id="apply-latlng" class="secondary">SET BOX FROM COORDINATES</button>
-          <div class="hint">alternative to drawing on the map — enter the box edges directly</div>
+          <div class="hint">alternative to placing the box on the map</div>
         </fieldset>
-        <div class="field">
-          <label for="max_points">Max grid points (2–2000)</label>
-          <input type="number" id="max_points" step="1" min="2" max="2000" value="500">
-          <div class="hint">higher = more detail, bigger STL, more tiles fetched</div>
-        </div>
-        <div class="field">
-          <label for="pin_diameter_mm">Pin hole ø (mm)</label>
-          <input type="number" id="pin_diameter_mm" step="any" min="0.5" value="2">
-          <div class="hint">cut through the shell; a vertical collar keeps pins upright on slopes</div>
-        </div>
+
         <fieldset>
-          <label><input type="checkbox" id="show_bathymetry"> Show bathymetry (sea-floor depth)</label>
-          <label><input type="checkbox" id="tiled"> Tiled (no edge padding)</label>
+          <legend>Elevation granularity</legend>
+          <div class="field">
+            <label for="max_points">Max grid points (2&ndash;2000)</label>
+            <input type="number" id="max_points" step="1" min="2" max="2000" value="500">
+            <div class="hint">higher = more detail, bigger STL, more tiles fetched</div>
+          </div>
+          <div class="field">
+            <label for="pin_diameter_mm">Pin hole &oslash; (mm)</label>
+            <input type="number" id="pin_diameter_mm" step="any" min="0.5" value="2">
+            <div class="hint">cut through the shell; a vertical collar keeps pins upright on slopes</div>
+          </div>
         </fieldset>
-        <div class="field">
-          <label for="distortion_exponent">Distortion exponent</label>
-          <input type="number" id="distortion_exponent" step="any">
-          <div class="hint">&lt;1 flattens peaks, exaggerates lowlands</div>
-        </div>
-        <div class="row">
+
+        <fieldset>
+          <legend>Vertical height &amp; distortion</legend>
           <div class="field">
-            <label for="dn_min">Norm. min (m)</label>
-            <input type="number" id="dn_min" step="any">
+            <label for="elevation_distortion">Elevation distortion</label>
+            <input type="number" id="elevation_distortion" step="any" min="0.01" placeholder="2">
+            <div class="hint">1.0 = true scale; defaults to 2 &mdash; tune live on the preview sliders</div>
+          </div>
+          <div class="or-divider">&mdash; or &mdash;</div>
+          <div class="field">
+            <label for="model_thickness_cm">Thickness (cm)</label>
+            <input type="number" id="model_thickness_cm" step="any" min="0.5">
+            <div class="hint">distorts elevation so the model has this height</div>
           </div>
           <div class="field">
-            <label for="dn_max">Norm. max (m)</label>
-            <input type="number" id="dn_max" step="any">
+            <label for="distortion_exponent">Distortion exponent</label>
+            <input type="number" id="distortion_exponent" step="any">
+            <div class="hint">&lt;1 flattens peaks, exaggerates lowlands</div>
           </div>
-        </div>
-        <div class="field">
-          <label for="min_z_val">Min z value (model meters)</label>
-          <input type="number" id="min_z_val" step="any">
-        </div>
+          <div class="row">
+            <div class="field">
+              <label for="dn_min">Norm. min (m)</label>
+              <input type="number" id="dn_min" step="any">
+            </div>
+            <div class="field">
+              <label for="dn_max">Norm. max (m)</label>
+              <input type="number" id="dn_max" step="any">
+            </div>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Data source</legend>
+          <div class="field">
+            <label for="elev_source">Elevation source</label>
+            <select id="elev_source">
+              <option value="aws" selected>AWS Terrain Tiles (no key)</option>
+              <option value="google">Google Elevation API (your key)</option>
+            </select>
+            <div class="hint">AWS tiles lack data in some regions (e.g. China) &mdash; use Google there</div>
+          </div>
+          <div class="field" id="google-key-field" style="display:none">
+            <label for="google_api_key">Google Maps API key</label>
+            <input type="text" id="google_api_key" placeholder="AIza&hellip;" autocomplete="off">
+            <div class="hint">needs Maps JavaScript API + Elevation API enabled; stored only in this browser</div>
+          </div>
+          <fieldset>
+            <label><input type="checkbox" id="show_bathymetry"> Show bathymetry (sea-floor depth)</label>
+          </fieldset>
+        </fieldset>
+
+        <fieldset>
+          <legend>Tiling</legend>
+          <label><input type="checkbox" id="tiled"> Tiled (no edge padding)</label>
+          <div class="field" style="margin-top:8px">
+            <label for="min_z_val">Min z value (model meters)</label>
+            <input type="number" id="min_z_val" step="any">
+            <div class="hint">set the same value on every tile so multiple tiled solids share one base height</div>
+          </div>
+        </fieldset>
       </details>
 
       <button type="submit" id="build" class="primary" disabled>BUILD</button>
+      <button type="button" id="share-btn" class="secondary" style="margin-top:10px" disabled>COPY SHARE LINK</button>
       <div class="hint" style="margin-top:10px">
         map © OpenStreetMap · elevation © AWS Terrain Tiles
       </div>
@@ -404,8 +439,9 @@
         "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
     } }
   </script>
-  <script src="topocore.js?v=27"></script>
-  <script src="elevation.js?v=27"></script>
-  <script type="module" src="app.js?v=27"></script>
+  <script src="topocore.js?v=28"></script>
+  <script src="elevation.js?v=28"></script>
+  <script src="elevation-google.js?v=28"></script>
+  <script type="module" src="app.js?v=28"></script>
 </body>
 </html>

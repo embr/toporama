@@ -359,6 +359,74 @@ function maybeEnableBuild() {
   // distortion 2 and lives under Advanced options / the preview sliders
   var ok = bounds && $('model_width_cm').value !== '';
   $('build').disabled = !ok;
+  $('share-btn').disabled = !ok;
+}
+
+// ---- shareable model URLs ----------------------------------------------
+// The full model spec is encoded in the query string, so a copied link
+// re-creates the same box, settings, and pins in someone else's browser —
+// they just click BUILD.
+function buildShareURL() {
+  var q = new URLSearchParams();
+  var f6 = function (x) { return (+x).toFixed(6); };
+  q.set('n', f6(bounds.north)); q.set('s', f6(bounds.south));
+  q.set('e', f6(bounds.east)); q.set('w', f6(bounds.west));
+  q.set('wcm', $('model_width_cm').value);
+  var pairs = [
+    ['name', 'model_name'], ['th', 'model_thickness_cm'],
+    ['dist', 'elevation_distortion'], ['exp', 'distortion_exponent'],
+    ['mp', 'max_points'], ['dia', 'pin_diameter_mm'],
+    ['dnmin', 'dn_min'], ['dnmax', 'dn_max'], ['minz', 'min_z_val']
+  ];
+  pairs.forEach(function (p) {
+    var v = $(p[1]).value;
+    if (v !== '' && v !== null) q.set(p[0], v);
+  });
+  var style = document.querySelector('input[name=toporama-style]:checked').value;
+  if (style !== 'plain') q.set('style', style);
+  if ($('show_bathymetry').checked) q.set('bath', '1');
+  if ($('tiled').checked) q.set('tiled', '1');
+  if ($('elev_source').value !== 'aws') q.set('src', $('elev_source').value);
+  var pinStr = pins.map(function (p) {
+    var ll = p.getLatLng();
+    return ll.lng.toFixed(5) + ',' + ll.lat.toFixed(5);
+  }).join(';');
+  if (pinStr) q.set('pins', pinStr);
+  if (document.body.classList.contains('mobile') &&
+      /[?&]mobile=1/.test(location.search)) q.set('mobile', '1');
+  return location.origin + location.pathname + '?' + q.toString();
+}
+
+function applySharedParams() {
+  var q = new URLSearchParams(location.search);
+  if (!q.get('n') || !q.get('s') || !q.get('e') || !q.get('w')) return;
+  var setV = function (id, key) { if (q.get(key) !== null) $(id).value = q.get(key); };
+  setV('model_name', 'name'); setV('model_width_cm', 'wcm');
+  setV('model_thickness_cm', 'th'); setV('elevation_distortion', 'dist');
+  setV('distortion_exponent', 'exp'); setV('max_points', 'mp');
+  setV('pin_diameter_mm', 'dia'); setV('dn_min', 'dnmin');
+  setV('dn_max', 'dnmax'); setV('min_z_val', 'minz');
+  if (q.get('style')) {
+    var r = document.querySelector('input[name=toporama-style][value="' +
+      q.get('style') + '"]');
+    if (r) r.checked = true;
+  }
+  $('show_bathymetry').checked = q.get('bath') === '1';
+  $('tiled').checked = q.get('tiled') === '1';
+  if (q.get('src')) {
+    $('elev_source').value = q.get('src');
+    $('elev_source').dispatchEvent(new Event('change'));
+  }
+  finishBox(+q.get('n'), +q.get('s'), +q.get('e'), +q.get('w'));
+  map.fitBounds([[+q.get('s'), +q.get('w')], [+q.get('n'), +q.get('e')]],
+    { padding: [40, 40] });
+  (q.get('pins') || '').split(';').forEach(function (t) {
+    var parts = t.split(',');
+    if (parts.length === 2 && isFinite(+parts[0]) && isFinite(+parts[1]))
+      addPin(L.latLng(+parts[1], +parts[0]));
+  });
+  maybeEnableBuild();
+  toast('model loaded from link — press BUILD');
 }
 function numOrNull(id) { var v = $(id).value; return v === '' ? null : parseFloat(v); }
 
@@ -475,13 +543,31 @@ function doBuild() {
   try { model = buildModelConfig(); } catch (e) { showError(e.message); return; }
 
   var grid = Topo.buildLngLatGrid(model.north, model.south, model.west, model.east, model.max_points);
-  setBuilding(true, 'Fetching elevation tiles…');
+  setBuilding(true, 'Fetching elevation…');
   setProgress(0);
 
-  TopoElev.fetchElevations(grid, { showBathymetry: model.show_bathymetry },
+  // pick the elevation source: keyless AWS tiles by default, or the
+  // user-keyed Google Elevation API (for regions AWS tiles lack)
+  var useGoogle = $('elev_source').value === 'google';
+  var fetchOpts = { showBathymetry: model.show_bathymetry };
+  var fetcher = TopoElev;
+  if (useGoogle) {
+    fetchOpts.apiKey = $('google_api_key').value.trim();
+    if (!fetchOpts.apiKey) {
+      setBuilding(false);
+      showError('Google elevation source selected but no API key entered ' +
+        '(Advanced options → Data source).');
+      return;
+    }
+    fetcher = TopoElevGoogle;
+  }
+  var unit = useGoogle ? 'rows' : 'tiles';
+
+  fetcher.fetchElevations(grid, fetchOpts,
     function (done, total) {
       setProgress(done / total * 0.6);
-      $('building-label').textContent = 'Fetching elevation tiles (' + done + '/' + total + ')…';
+      $('building-label').textContent = 'Fetching elevation ' + unit +
+        ' (' + done + '/' + total + ')…';
     }).then(function (elev) {
     setProgress(0.65);
     $('building-label').textContent = 'Building mesh…';
@@ -655,7 +741,8 @@ function showPreview(d, preserveView) {
   add('size (mm)', d.size_mm.map(function (x) { return x.toFixed(1); }).join(' × '));
   add('grid', d.model.max_points + ' pts → ' + d.num_vertices.toLocaleString() + ' vertices');
   add('grid spacing (m)', d.grid_spacing_m.toFixed(1));
-  if (d.resolution) add('tile resolution (m)', '~' + d.resolution.median + ' (zoom ' + d.zoom + ')');
+  if (d.resolution) add('data resolution (m)', '~' + d.resolution.median +
+    (d.zoom ? ' (zoom ' + d.zoom + ')' : ' (Google)'));
   if (d.model.pin_holes)
     add('pin holes', d.model.pin_holes.locations.length + ' × ø' +
         d.model.pin_holes.diameter_mm + ' mm, vertical guide collar on slopes');
@@ -664,6 +751,7 @@ function showPreview(d, preserveView) {
   meta.appendChild(dl2);
 
   $('preview-panel').style.display = 'flex';
+  document.body.classList.add('previewing');   // hides the (inert) sidebar
   renderMesh(d.positions, d.indices, preserveView).catch(function (err) {
     $('preview-meta').insertAdjacentHTML('afterbegin',
       '<div class="msg info" style="display:block">3D preview unavailable (' +
@@ -811,11 +899,35 @@ document.addEventListener('DOMContentLoaded', function () {
   $('light-alt').addEventListener('input', function () {
     viewPrefs.alt = parseFloat($('light-alt').value); applyViewPrefs();
   });
+  // share link
+  $('share-btn').addEventListener('click', function () {
+    var url = buildShareURL();
+    try { history.replaceState(null, '', url); } catch (e) {}
+    var done = function () { toast('share link copied to clipboard'); };
+    if (navigator.clipboard && navigator.clipboard.writeText)
+      navigator.clipboard.writeText(url).then(done, function () { prompt('Copy this link:', url); });
+    else prompt('Copy this link:', url);
+  });
+  // data source: show/hide + persist the Google key locally
+  $('elev_source').addEventListener('change', function () {
+    $('google-key-field').style.display =
+      $('elev_source').value === 'google' ? '' : 'none';
+  });
+  try {
+    var savedKey = localStorage.getItem('toporama_google_key');
+    if (savedKey) $('google_api_key').value = savedKey;
+  } catch (e) {}
+  $('google_api_key').addEventListener('change', function () {
+    try { localStorage.setItem('toporama_google_key', $('google_api_key').value.trim()); } catch (e) {}
+  });
+  // restore a shared model from the URL (after the map exists)
+  applySharedParams();
   $('preview-close').addEventListener('click', function () {
     // back to the map with the box, handles, and pins exactly as they were
     // (bounds/boxLayer are never cleared by a build), so the user can nudge
     // a corner or add pins and hit BUILD again.
     $('preview-panel').style.display = 'none';
+    document.body.classList.remove('previewing');
     if (map) map.invalidateSize();
   });
   window.addEventListener('resize', function () { if (map) map.invalidateSize(); });

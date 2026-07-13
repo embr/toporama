@@ -601,6 +601,57 @@
     return { xyScale: xyScale, zScale: zScale, zDistortion: zDistortion };
   }
 
+  // bilinear z on a padded grid mesh (x ascends with col, y DESCENDS with
+  // row; row 1 / col 1 are the first unpadded coordinates)
+  function gridSampleZ(verts, rows, cols, x, y) {
+    var lo = 1, hi = cols - 2, c, r;
+    while (hi - lo > 1) { c = (lo + hi) >> 1;
+      if (verts[(cols + c) * 3] <= x) lo = c; else hi = c; }
+    c = lo;
+    lo = 1; hi = rows - 2;
+    while (hi - lo > 1) { r = (lo + hi) >> 1;
+      if (verts[(r * cols + 1) * 3 + 1] >= y) lo = r; else hi = r; }
+    r = lo;
+    var i00 = (r * cols + c) * 3, i01 = i00 + 3;
+    var i10 = ((r + 1) * cols + c) * 3, i11 = i10 + 3;
+    var x0 = verts[i00], x1 = verts[i01], y0 = verts[i00 + 1], y1 = verts[i10 + 1];
+    var fx = x1 === x0 ? 0 : (x - x0) / (x1 - x0);
+    var fy = y1 === y0 ? 0 : (y - y0) / (y1 - y0);
+    fx = Math.max(0, Math.min(1, fx)); fy = Math.max(0, Math.min(1, fy));
+    return (verts[i00 + 2] * (1 - fx) + verts[i01 + 2] * fx) * (1 - fy) +
+           (verts[i10 + 2] * (1 - fx) + verts[i11 + 2] * fx) * fy;
+  }
+
+  // How deep must the model base be so every tilted pin hole fits a full
+  // vertical guide collar? Returns the required base z (or null when no
+  // hole needs a collar). Called BEFORE the bottom is final so buildSolid
+  // can deepen the base rather than truncating collars against it — a pin
+  // on a steep valley wall near the base would otherwise silently lose
+  // its collar (and its vertical guidance) to the base-plane clamp.
+  function pinBaseRequirement(top, m, n, holes, xyScale) {
+    var rows = m + 2, cols = n + 2;
+    var tv = top.vertices;
+    var rBore = holes.diameter_mm / 2000;
+    var boreLen = PIN_BORE_MM / 1000;
+    var tiltLim = PIN_TILT_MM / 1000;
+    var segs = 16, need = null;
+    holes.locations.forEach(function (loc) {
+      var p = project(loc[0], loc[1]);
+      var px = p[0] * xyScale, py = p[1] * xyScale;
+      var minRim = Infinity, maxRim = -Infinity;
+      for (var k = 0; k < segs; k++) {
+        var th = 2 * Math.PI * k / segs;
+        var z = gridSampleZ(tv, rows, cols, px + rBore * Math.cos(th), py + rBore * Math.sin(th));
+        if (z < minRim) minRim = z;
+        if (z > maxRim) maxRim = z;
+      }
+      if (maxRim - minRim < tiltLim) return;   // flat enough: puncture, no collar
+      var thisNeed = minRim - boreLen;
+      if (need === null || thisNeed < need) need = thisNeed;
+    });
+    return need;
+  }
+
   // Cut pin holes: a vertical cylindrical bore through the top surface,
   // extended downward by a GUIDE COLLAR so a physical map pin stands
   // upright even when the hole is on a steep slope. Without the collar the
@@ -628,6 +679,7 @@
   var HOLE_CHORD_MM = 0.35;      // ring segment length: circularity in mm
   var PIN_BORE_MM = 4;           // vertical bore below the lowest rim point
   var PIN_COLLAR_WALL_MM = 1.2;  // collar wall thickness around the bore
+  var PIN_TILT_MM = 0.2;         // rim height span that counts as 'tilted'
 
   function cutPinHoles(top, bottom, m, n, holes, xyScale) {
     var rows = m + 2, cols = n + 2;
@@ -646,26 +698,7 @@
     for (var q = 0; q < bottom.numVertices(); q++)
       if (bv[q * 3 + 2] < baseZ) baseZ = bv[q * 3 + 2];
 
-    // bilinear z on a padded grid mesh (x ascends with col, y DESCENDS
-    // with row; row 1 / col 1 are the first unpadded coordinates)
-    function gridZ(verts, x, y) {
-      var lo = 1, hi = cols - 2, c, r;
-      while (hi - lo > 1) { c = (lo + hi) >> 1;
-        if (verts[(cols + c) * 3] <= x) lo = c; else hi = c; }
-      c = lo;
-      lo = 1; hi = rows - 2;
-      while (hi - lo > 1) { r = (lo + hi) >> 1;
-        if (verts[(r * cols + 1) * 3 + 1] >= y) lo = r; else hi = r; }
-      r = lo;
-      var i00 = (r * cols + c) * 3, i01 = i00 + 3;
-      var i10 = ((r + 1) * cols + c) * 3, i11 = i10 + 3;
-      var x0 = verts[i00], x1 = verts[i01], y0 = verts[i00 + 1], y1 = verts[i10 + 1];
-      var fx = x1 === x0 ? 0 : (x - x0) / (x1 - x0);
-      var fy = y1 === y0 ? 0 : (y - y0) / (y1 - y0);
-      fx = Math.max(0, Math.min(1, fx)); fy = Math.max(0, Math.min(1, fy));
-      return (verts[i00 + 2] * (1 - fx) + verts[i01 + 2] * fx) * (1 - fy) +
-             (verts[i10 + 2] * (1 - fx) + verts[i11 + 2] * fx) * fy;
-    }
+    function gridZ(verts, x, y) { return gridSampleZ(verts, rows, cols, x, y); }
 
     holes.locations.forEach(function (loc) {
       var p = project(loc[0], loc[1]);
@@ -748,12 +781,14 @@
       }
       var collarBot = Math.min(minRim - boreLen, minOuter - 0.0003);
       if (collarBot < baseZ) collarBot = baseZ;
-      // If there is no room below the bottom shell (flat/low-relief areas,
-      // where the shell already sits on the base plane), fall back to a
-      // plain puncture: there the shell is horizontal, so a bore the depth
-      // of the shell already holds a pin vertical -- the collar is only
-      // needed where the terrain (and thus the shell) is tilted.
-      var simple = collarBot >= minOuter - 0.0001 || collarBot >= minRim - 0.0005;
+      // A collar is only needed when the rim is tilted (a horizontal shell
+      // already holds a pin vertical). For tilted rims, buildSolid has
+      // pre-deepened the base so the collar always fits; the room check
+      // below is a safety net, not the normal path.
+      var maxRim = -Infinity;
+      for (var k5 = 0; k5 < segs; k5++) if (ringTz[k5] > maxRim) maxRim = ringTz[k5];
+      var simple = (maxRim - minRim) < PIN_TILT_MM / 1000 ||
+        collarBot >= minOuter - 0.0001 || collarBot >= minRim - 0.0005;
 
       cellsT.forEach(function (k) { removedTop[k] = 1; });
       (simple ? cellsT : cellsB).forEach(function (k) { removedBot[k] = 1; });
@@ -874,6 +909,20 @@
     var top = makeTop(ptsWorld, m, n, model.top_pad_width);
     var bottom = makeBottom(top, model.top_thickness, model.wall_thickness,
       (model.min_z_val === undefined ? null : model.min_z_val));
+    if (model.pin_holes && model.pin_holes.locations &&
+        model.pin_holes.locations.length) {
+      // deepen the base if a tilted pin hole needs more room for its
+      // vertical guide collar (makes the model slightly taller rather
+      // than truncating the collar against the base plane)
+      var needBase = pinBaseRequirement(top, m, n, model.pin_holes, scale.xyScale);
+      var curBase = Infinity;
+      for (var bi = 0; bi < bottom.numVertices(); bi++)
+        if (bottom.vertices[bi * 3 + 2] < curBase) curBase = bottom.vertices[bi * 3 + 2];
+      if (needBase !== null && needBase < curBase) {
+        bottom = makeBottom(top, model.top_thickness, model.wall_thickness, needBase);
+        info.base_lowered_mm = Math.round((curBase - needBase) * 100000) / 100;
+      }
+    }
     // outer sides come from the UNCUT perimeter; pin holes only ever remove
     // interior cells, so cutting after this is safe
     var sides = makeSides(top, bottom);
