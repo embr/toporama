@@ -601,45 +601,50 @@
     return { xyScale: xyScale, zScale: zScale, zDistortion: zDistortion };
   }
 
-  // Cut through-hole pin holes: full cylinders removed from the top
-  // surface through the bottom shell, so a physical map pin passes clean
-  // through the crust (the model is an open shell underneath, so puncturing
-  // it gives an unobstructed hole of any pin length).
+  // Cut pin holes: a vertical cylindrical bore through the top surface,
+  // extended downward by a GUIDE COLLAR so a physical map pin stands
+  // upright even when the hole is on a steep slope. Without the collar the
+  // bore is only as long as the ~0.7mm shell, whose direction follows the
+  // terrain -- a pin would flop to the slope angle. The collar is a local
+  // boss under the hole: bore wall (inner cylinder), a flat annular washer
+  // at the bottom, and an outer cylinder wall rejoining the bottom shell.
+  // Material is only added in a ~1.2mm ring around each pin.
   //
-  // The top and bottom meshes share grid topology (bottom = the top's faces
-  // flipped, vertices projected down), which makes a CSG-free cut possible:
-  // remove the SAME grid cells from both, then stitch a vertical wall
-  // between the top and bottom boundary rings of the opening. Every removed
-  // boundary edge gains exactly one wall triangle on top and one on bottom,
-  // so edge counts stay at 2 and the solid stays watertight.
+  // Cross-sections are TRUE CIRCLES with smoothness set in absolute mm
+  // (ring chord ~HOLE_CHORD_MM), independent of the terrain grid: cells
+  // are removed around the pin (a tight set on top for the bore, a wider
+  // set on the bottom for the collar), rings of vertices are inserted at
+  // the exact radii, and staircase boundaries are stitched to the rings
+  // with annuli of triangles.
   //
-  // The hole cross-section is a TRUE CIRCLE whose smoothness is set in
-  // absolute millimetres, independent of the terrain grid: grid cells
-  // around the pin are removed with a safety margin, then a ring of
-  // vertices (chord length ~HOLE_CHORD_MM) is inserted at the exact hole
-  // radius and stitched to the staircase boundary of the removed cells
-  // with an annulus of triangles (top and bottom), plus a cylindrical
-  // wall between the two rings. Ring z values are bilinearly sampled from
-  // the surrounding surface, so the hole rim follows the terrain.
+  // Watertightness bookkeeping (each edge shared by exactly two faces):
+  // kept-top staircase <-> top annulus; top annulus <-> bore ring; bore
+  // wall <-> washer inner; washer outer <-> collar wall; collar wall <->
+  // bottom annulus ring; bottom annulus <-> kept-bottom staircase.
   //
-  // Watertightness bookkeeping: every kept-mesh boundary edge gets exactly
-  // one annulus triangle (top and bottom), every ring edge is shared by
-  // annulus + wall, and every wall vertical edge is shared by adjacent
-  // wall quads — all edge counts stay at 2.
-  //
-  // Holes whose expanded cell footprint would leave the grid interior or
-  // overlap another hole are skipped (reported via the returned `skipped`).
-  var HOLE_CHORD_MM = 0.35;   // ring segment length: sets circularity in mm
+  // Holes are skipped (reported via `skipped`) if their footprint leaves
+  // the grid interior, overlaps another hole, or the local geometry can't
+  // fit a collar (e.g. rim below the base plane on an extreme cliff).
+  var HOLE_CHORD_MM = 0.35;      // ring segment length: circularity in mm
+  var PIN_BORE_MM = 4;           // vertical bore below the lowest rim point
+  var PIN_COLLAR_WALL_MM = 1.2;  // collar wall thickness around the bore
 
   function cutPinHoles(top, bottom, m, n, holes, xyScale) {
     var rows = m + 2, cols = n + 2;
     var cellsX = cols - 1, cellsY = rows - 1;
-    var radius = holes.diameter_mm / 2000;   // mm -> model metres
+    var rBore = holes.diameter_mm / 2000;              // mm -> model metres
+    var rColl = rBore + PIN_COLLAR_WALL_MM / 1000;
+    var boreLen = PIN_BORE_MM / 1000;
     var segs = Math.max(16, Math.min(64,
       Math.round(Math.PI * holes.diameter_mm / HOLE_CHORD_MM)));
     var tv = top.vertices, bv = bottom.vertices;
-    var removedAll = new Uint8Array(cellsY * cellsX);
+    var removedTop = new Uint8Array(cellsY * cellsX);
+    var removedBot = new Uint8Array(cellsY * cellsX);
     var extras = [], skipped = 0;
+
+    var baseZ = Infinity;                              // model base plane
+    for (var q = 0; q < bottom.numVertices(); q++)
+      if (bv[q * 3 + 2] < baseZ) baseZ = bv[q * 3 + 2];
 
     // bilinear z on a padded grid mesh (x ascends with col, y DESCENDS
     // with row; row 1 / col 1 are the first unpadded coordinates)
@@ -666,145 +671,180 @@
       var p = project(loc[0], loc[1]);
       var px = p[0] * xyScale, py = p[1] * xyScale;
 
-      // local grid spacing -> removal margin that guarantees the circle
-      // lies strictly inside the removed cells
       var sx = tv[(cols + 2) * 3] - tv[(cols + 1) * 3];
       var sy = Math.abs(tv[(2 * cols + 1) * 3 + 1] - tv[(cols + 1) * 3 + 1]);
       var margin = 0.71 * Math.max(sx, sy);
-      var rOut = radius + margin, rOut2 = rOut * rOut;
 
-      // collect this hole's cells; bail out (skip) if any falls outside
-      // the interior or into another hole's footprint
-      var cells = [], ok = true;
-      var cMin = Math.max(1, Math.floor((px - rOut - tv[(cols + 1) * 3]) / sx));
-      for (var r = 1; r < cellsY - 1 && ok; r++) {
-        for (var c = 1; c < cellsX - 1; c++) {
-          var v00 = (r * cols + c) * 3, v11 = ((r + 1) * cols + c + 1) * 3;
-          var cx = (tv[v00] + tv[v11]) / 2, cy = (tv[v00 + 1] + tv[v11 + 1]) / 2;
-          var dx = cx - px, dy = cy - py;
-          if (dx * dx + dy * dy > rOut2) continue;
-          if (removedAll[r * cellsX + c]) { ok = false; break; }
-          cells.push(r * cellsX + c);
+      // collect cells: tight set for the top (bore), wide set for the
+      // bottom (collar); reject if outside the interior or overlapping
+      // another hole's footprint
+      function collect(radius) {
+        var rOut = radius + margin, rOut2 = rOut * rOut, cells = [];
+        for (var r = 1; r < cellsY - 1; r++) {
+          for (var c = 1; c < cellsX - 1; c++) {
+            var v00 = (r * cols + c) * 3, v11 = ((r + 1) * cols + c + 1) * 3;
+            var cx = (tv[v00] + tv[v11]) / 2, cy = (tv[v00 + 1] + tv[v11 + 1]) / 2;
+            var dx = cx - px, dy = cy - py;
+            if (dx * dx + dy * dy <= rOut2) cells.push(r * cellsX + c);
+          }
         }
+        return cells;
       }
-      // a hole hugging the box edge would need border cells -> reject if
-      // the circle isn't fully covered by collected cells (checked below
-      // via boundary distance), or if no cell qualified at all
-      if (!ok || !cells.length) { skipped++; return; }
-      cells.forEach(function (k) { removedAll[k] = 1; });
-
-      // boundary edges of this hole's cell set -> unique loop vertices
-      var isMine = {};
-      cells.forEach(function (k) { isMine[k] = 1; });
-      var loopSet = {}, minB2 = Infinity;
-      function edgeVerts(a, b) { loopSet[a] = 1; loopSet[b] = 1; }
-      cells.forEach(function (k) {
+      var cellsT = collect(rBore), cellsB = collect(rColl);
+      var ok = cellsT.length > 0 && cellsB.length > 0;
+      cellsB.forEach(function (k) {
+        if (removedBot[k] || removedTop[k]) ok = false;
         var r = (k / cellsX) | 0, c = k % cellsX;
-        var v00 = r * cols + c, v01 = v00 + 1, v10 = v00 + cols, v11 = v10 + 1;
-        if (!isMine[k - cellsX]) edgeVerts(v00, v01);
-        if (!isMine[k + cellsX]) edgeVerts(v10, v11);
-        if (!isMine[k - 1]) edgeVerts(v00, v10);
-        if (!isMine[k + 1]) edgeVerts(v01, v11);
+        if (r < 1 || r >= cellsY - 1 || c < 1 || c >= cellsX - 1) ok = false;
       });
-      var loop = Object.keys(loopSet).map(Number);
-      loop.forEach(function (vi) {
-        var dx = tv[vi * 3] - px, dy = tv[vi * 3 + 1] - py;
-        var d2 = dx * dx + dy * dy;
-        if (d2 < minB2) minB2 = d2;
-      });
-      // circle must be strictly inside the opening (can fail for a hole
-      // pressed against the box edge, where border cells were off-limits)
-      if (minB2 <= radius * radius) {
-        cells.forEach(function (k) { removedAll[k] = 0; });
+      if (!ok) { skipped++; return; }
+
+      // boundary loop of a cell set on a given mesh -> angle-sorted verts
+      function boundaryLoop(cells, verts) {
+        var isMine = {};
+        cells.forEach(function (k) { isMine[k] = 1; });
+        var set = {};
+        cells.forEach(function (k) {
+          var r = (k / cellsX) | 0, c = k % cellsX;
+          var v00 = r * cols + c, v01 = v00 + 1, v10 = v00 + cols, v11 = v10 + 1;
+          if (!isMine[k - cellsX]) { set[v00] = 1; set[v01] = 1; }
+          if (!isMine[k + cellsX]) { set[v10] = 1; set[v11] = 1; }
+          if (!isMine[k - 1]) { set[v00] = 1; set[v10] = 1; }
+          if (!isMine[k + 1]) { set[v01] = 1; set[v11] = 1; }
+        });
+        var loop = Object.keys(set).map(Number);
+        loop.sort(function (a, b) {
+          var aa = Math.atan2(verts[a * 3 + 1] - py, verts[a * 3] - px);
+          var ab = Math.atan2(verts[b * 3 + 1] - py, verts[b * 3] - px);
+          if (aa !== ab) return aa - ab;
+          var ra = (verts[a * 3] - px) * (verts[a * 3] - px) + (verts[a * 3 + 1] - py) * (verts[a * 3 + 1] - py);
+          var rb = (verts[b * 3] - px) * (verts[b * 3] - px) + (verts[b * 3 + 1] - py) * (verts[b * 3 + 1] - py);
+          return ra - rb;
+        });
+        return loop;
+      }
+      var loopT = boundaryLoop(cellsT, tv), loopB = boundaryLoop(cellsB, bv);
+      var minD2 = function (loop, verts) {
+        var mn = Infinity;
+        loop.forEach(function (vi) {
+          var dx = verts[vi * 3] - px, dy = verts[vi * 3 + 1] - py;
+          if (dx * dx + dy * dy < mn) mn = dx * dx + dy * dy;
+        });
+        return mn;
+      };
+      if (minD2(loopT, tv) <= rBore * rBore || minD2(loopB, bv) <= rColl * rColl) {
         skipped++; return;
       }
-      // sort boundary vertices by angle around the pin (radius tiebreak)
-      loop.sort(function (a, b) {
-        var aa = Math.atan2(tv[a * 3 + 1] - py, tv[a * 3] - px);
-        var ab = Math.atan2(tv[b * 3 + 1] - py, tv[b * 3] - px);
-        if (aa !== ab) return aa - ab;
-        var ra = (tv[a * 3] - px) * (tv[a * 3] - px) + (tv[a * 3 + 1] - py) * (tv[a * 3 + 1] - py);
-        var rb = (tv[b * 3] - px) * (tv[b * 3] - px) + (tv[b * 3 + 1] - py) * (tv[b * 3 + 1] - py);
-        return ra - rb;
-      });
 
-      // hole-local mesh: outer loop verts (top+bottom copies) + ring verts
-      var hv = [], P = loop.length;
-      loop.forEach(function (vi) {           // 0..P-1: outer top
+      // ring z samples and the collar bottom plane
+      var ringTz = [], outerTz = [], minRim = Infinity, minOuter = Infinity;
+      for (var k2 = 0; k2 < segs; k2++) {
+        var th = -Math.PI + (2 * Math.PI * k2) / segs;
+        var zt = gridZ(tv, px + rBore * Math.cos(th), py + rBore * Math.sin(th));
+        var zo = gridZ(bv, px + rColl * Math.cos(th), py + rColl * Math.sin(th));
+        ringTz.push(zt); outerTz.push(zo);
+        if (zt < minRim) minRim = zt;
+        if (zo < minOuter) minOuter = zo;
+      }
+      var collarBot = Math.min(minRim - boreLen, minOuter - 0.0003);
+      if (collarBot < baseZ) collarBot = baseZ;
+      // If there is no room below the bottom shell (flat/low-relief areas,
+      // where the shell already sits on the base plane), fall back to a
+      // plain puncture: there the shell is horizontal, so a bore the depth
+      // of the shell already holds a pin vertical -- the collar is only
+      // needed where the terrain (and thus the shell) is tilted.
+      var simple = collarBot >= minOuter - 0.0001 || collarBot >= minRim - 0.0005;
+
+      cellsT.forEach(function (k) { removedTop[k] = 1; });
+      (simple ? cellsT : cellsB).forEach(function (k) { removedBot[k] = 1; });
+
+      // hole-local mesh: loops + four rings
+      var hv = [], hf = [];
+      if (simple) loopB = boundaryLoop(cellsT, bv);
+      var PT = loopT.length, PB = loopB.length;
+      loopT.forEach(function (vi) {          // 0..PT-1: top staircase
         hv.push(tv[vi * 3], tv[vi * 3 + 1], tv[vi * 3 + 2]);
       });
-      loop.forEach(function (vi) {           // P..2P-1: outer bottom
+      loopB.forEach(function (vi) {          // PT..PT+PB-1: bottom staircase
         hv.push(bv[vi * 3], bv[vi * 3 + 1], bv[vi * 3 + 2]);
       });
-      var ringT = [], ringB = [];
-      for (var k2 = 0; k2 < segs; k2++) {    // 2P..2P+S-1 top, then S bottom
-        var th = -Math.PI + (2 * Math.PI * k2) / segs;
-        var rx = px + radius * Math.cos(th), ry = py + radius * Math.sin(th);
-        ringT.push(hv.length / 3); hv.push(rx, ry, gridZ(tv, rx, ry));
+      function ring(radius, zOf) {
+        var idx = [];
+        for (var k3 = 0; k3 < segs; k3++) {
+          var t3 = -Math.PI + (2 * Math.PI * k3) / segs;
+          idx.push(hv.length / 3);
+          hv.push(px + radius * Math.cos(t3), py + radius * Math.sin(t3), zOf(k3));
+        }
+        return idx;
       }
-      for (k2 = 0; k2 < segs; k2++) {
-        var th2 = -Math.PI + (2 * Math.PI * k2) / segs;
-        var rx2 = px + radius * Math.cos(th2), ry2 = py + radius * Math.sin(th2);
-        ringB.push(hv.length / 3); hv.push(rx2, ry2, gridZ(bv, rx2, ry2));
+      var ringTB = ring(rBore, function (k3) { return ringTz[k3]; }); // bore top
+      var ringBB, ringOT, ringOB;
+      if (simple) {
+        // puncture: one inner ring on the bottom shell surface
+        ringBB = ring(rBore, function (k3) {
+          return gridZ(bv, px + rBore * Math.cos(-Math.PI + 2 * Math.PI * k3 / segs),
+                           py + rBore * Math.sin(-Math.PI + 2 * Math.PI * k3 / segs));
+        });
+      } else {
+        ringBB = ring(rBore, function () { return collarBot; });      // bore bottom
+        ringOT = ring(rColl, function (k3) { return outerTz[k3]; });  // collar top
+        ringOB = ring(rColl, function () { return collarBot; });      // collar bottom
       }
 
-      // annulus triangulation: merge-walk outer loop and ring by angle.
-      // Both sequences ascend in angle, so advancing the outer produces
-      // (lastO, newO, lastI) and advancing the ring (newI, lastI, lastO),
-      // both counter-clockwise (facing up) for the top surface.
-      var hf = [];
-      function ringAngle(k) { return -Math.PI + (2 * Math.PI * k) / segs; }
-      function loopAngle(i) {
-        return Math.atan2(hv[i * 3 + 1] - py, hv[i * 3] - px);
-      }
-      function zipAnnulus(outerOf, innerOf, flip) {
+      function ringAngle(k3) { return -Math.PI + (2 * Math.PI * k3) / segs; }
+      function vAngle(i) { return Math.atan2(hv[i * 3 + 1] - py, hv[i * 3] - px); }
+      // annulus between an angle-sorted staircase loop and a ring
+      function zip(loopStart, P, ringIdx, flip) {
         var i = 0, j = 0;
-        var lastO = outerOf(P - 1), lastI = innerOf(segs - 1);
+        var lastO = loopStart + P - 1, lastI = ringIdx[segs - 1];
         while (i < P || j < segs) {
           var advOuter;
           if (i >= P) advOuter = false;
           else if (j >= segs) advOuter = true;
-          else advOuter = loopAngle(outerOf(i)) <= ringAngle(j);
+          else advOuter = vAngle(loopStart + i) <= ringAngle(j);
           if (advOuter) {
-            var nO = outerOf(i++);
+            var nO = loopStart + i; i++;
             if (flip) hf.push(nO, lastO, lastI); else hf.push(lastO, nO, lastI);
             lastO = nO;
           } else {
-            var nI = innerOf(j++);
+            var nI = ringIdx[j]; j++;
             if (flip) hf.push(lastI, nI, lastO); else hf.push(nI, lastI, lastO);
             lastI = nI;
           }
         }
       }
-      zipAnnulus(function (i) { return i; }, function (j) { return ringT[j]; }, false);
-      zipAnnulus(function (i) { return P + i; }, function (j) { return ringB[j]; }, true);
+      zip(0, PT, ringTB, false);     // top surface annulus (faces up)
+      zip(PT, PB, simple ? ringBB : ringOT, true); // bottom annulus (faces down)
 
-      // cylindrical wall between the two rings, facing the hole axis
       for (k2 = 0; k2 < segs; k2++) {
-        var a = ringT[k2], b = ringT[(k2 + 1) % segs];
-        var a2 = ringB[k2], b2 = ringB[(k2 + 1) % segs];
-        // ring ascends CCW seen from above; traversing the top edge a->b
-        // (ascending) gives inward-facing normals AND complements the
-        // annulus triangles' descending traversal of the same edges
+        var a, b, a2, b2, k4 = (k2 + 1) % segs;
+        // bore wall: faces the hole axis (inward)
+        a = ringTB[k2]; b = ringTB[k4]; a2 = ringBB[k2]; b2 = ringBB[k4];
         hf.push(a, b, b2, a, b2, a2);
+        if (!simple) {
+          // collar outer wall: faces away from the axis (outward)
+          a = ringOT[k2]; b = ringOT[k4]; a2 = ringOB[k2]; b2 = ringOB[k4];
+          hf.push(b, a, a2, b, a2, b2);
+          // washer (collar bottom): faces down
+          var O0 = ringOB[k2], O1 = ringOB[k4], I0 = ringBB[k2], I1 = ringBB[k4];
+          hf.push(O1, O0, I0, O1, I0, I1);
+        }
       }
       extras.push(new Mesh(new Float64Array(hv), new Int32Array(hf)));
     });
 
-    // filter both face lists (cell k -> triangles 2k, 2k+1 in grid order;
-    // bottom.faces is the flipped copy in the same order)
-    function keepFaces(faces) {
+    function keepFaces(faces, removed) {
       var kept = [], nCells = cellsY * cellsX;
       for (var k = 0; k < nCells; k++) {
-        if (removedAll[k]) continue;
+        if (removed[k]) continue;
         for (var j = 0; j < 6; j++) kept.push(faces[k * 6 + j]);
       }
       return new Int32Array(kept);
     }
 
     return {
-      top: new Mesh(top.vertices, keepFaces(top.faces)),
-      bottom: new Mesh(bottom.vertices, keepFaces(bottom.faces)),
+      top: new Mesh(top.vertices, keepFaces(top.faces, removedTop)),
+      bottom: new Mesh(bottom.vertices, keepFaces(bottom.faces, removedBot)),
       extras: extras,
       skipped: skipped
     };

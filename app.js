@@ -658,7 +658,7 @@ function showPreview(d, preserveView) {
   if (d.resolution) add('tile resolution (m)', '~' + d.resolution.median + ' (zoom ' + d.zoom + ')');
   if (d.model.pin_holes)
     add('pin holes', d.model.pin_holes.locations.length + ' × ø' +
-        d.model.pin_holes.diameter_mm + ' mm, cut through');
+        d.model.pin_holes.diameter_mm + ' mm, vertical guide collar on slopes');
   if (d.resolution && d.resolution.median > 2 * d.grid_spacing_m)
     add('note', 'terrain tiles are coarser than the grid here — extra points cannot add detail');
   meta.appendChild(dl2);
