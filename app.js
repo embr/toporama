@@ -286,9 +286,12 @@ function addPin(latlng) {
     map.removeLayer(p);
     pins.splice(pins.indexOf(p), 1);
     updatePinStatus();
+    updateShareURL();
   });
+  p.on('dragend', updateShareURL);
   pins.push(p);
   updatePinStatus();
+  updateShareURL();
 }
 function onMapClickForPin(e) {
   if (activeTool !== 'pin') return;
@@ -360,6 +363,14 @@ function maybeEnableBuild() {
   var ok = bounds && $('model_width_cm').value !== '';
   $('build').disabled = !ok;
   $('share-btn').disabled = !ok;
+  updateShareURL();
+}
+
+// keep the address bar in sync with the current model spec, so the URL is
+// always shareable without pressing anything
+function updateShareURL() {
+  if (!bounds) return;
+  try { history.replaceState(null, '', buildShareURL()); } catch (e) {}
 }
 
 // ---- shareable model URLs ----------------------------------------------
@@ -502,6 +513,7 @@ function remesh(fields) {
     model2.output_z_distortion = fields.output_z_distortion;
   }
   lastBuild.model = model2;
+  updateShareURL();   // sliders sync the form programmatically — refresh URL
   var world2 = lastBuild.world.slice();
   // busy state: announce, grey out and lock the sliders so a second
   // adjustment can't pile onto an in-flight re-mesh
@@ -539,6 +551,12 @@ function setTuneBusy(on) {
 
 function doBuild() {
   clearError();
+  // when rebuilding from the preview's edit drawer, drop back to the map
+  // so the build-progress overlay is visible; the new preview replaces it
+  if (document.body.classList.contains('previewing')) {
+    $('preview-panel').style.display = 'none';
+    document.body.classList.remove('previewing');
+  }
   var model;
   try { model = buildModelConfig(); } catch (e) { showError(e.message); return; }
 
@@ -751,7 +769,8 @@ function showPreview(d, preserveView) {
   meta.appendChild(dl2);
 
   $('preview-panel').style.display = 'flex';
-  document.body.classList.add('previewing');   // hides the (inert) sidebar
+  document.body.classList.add('previewing');   // sidebar -> collapsed drawer
+  closeSidebar();                              // start collapsed
   renderMesh(d.positions, d.indices, preserveView).catch(function (err) {
     $('preview-meta').insertAdjacentHTML('afterbegin',
       '<div class="msg info" style="display:block">3D preview unavailable (' +
@@ -922,13 +941,17 @@ document.addEventListener('DOMContentLoaded', function () {
   });
   // restore a shared model from the URL (after the map exists)
   applySharedParams();
+  $('preview-edit').addEventListener('click', openSidebar);
   $('preview-close').addEventListener('click', function () {
     // back to the map with the box, handles, and pins exactly as they were
     // (bounds/boxLayer are never cleared by a build), so the user can nudge
     // a corner or add pins and hit BUILD again.
     $('preview-panel').style.display = 'none';
     document.body.classList.remove('previewing');
+    openSidebar();   // restore the sidebar (no-op visual on desktop map view)
     if (map) map.invalidateSize();
   });
+  // any settings change keeps the shareable URL current
+  $('build-form').addEventListener('change', updateShareURL);
   window.addEventListener('resize', function () { if (map) map.invalidateSize(); });
 });

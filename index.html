@@ -104,9 +104,20 @@
     .msg { font-size: 12px; padding: 8px 10px; border-radius: 8px; margin-bottom: 12px; white-space: pre-wrap; display: none; }
     .msg.error { background: #fdecea; color: #b3261e; border: 1px solid #f5c6c0; }
     .msg.info { background: #eef4fb; color: #1c4e80; border: 1px solid #cfe0f2; }
-    /* while previewing, the sidebar form is inert - hide it and give the
-       preview the full window; Back to map restores it */
-    body.previewing #sidebar { display: none; }
+    /* while previewing, the sidebar collapses into an overlay drawer (the
+       preview gets the full window) but stays accessible via the EDIT
+       MODEL button, so settings can be changed and BUILD pressed without
+       leaving the preview */
+    body.previewing #sidebar {
+      position: fixed; top: 0; left: 0; bottom: 0; z-index: 30;
+      width: min(86vw, 340px); min-width: 0;
+      transform: translateX(-100%);
+      transition: transform 0.25s ease;
+      box-shadow: 2px 0 24px rgba(0,0,0,0.3);
+    }
+    body.previewing #sidebar.open { transform: translateX(0); }
+    body.previewing #sidebar-scrim.show { display: block; opacity: 1; z-index: 28; }
+    body.previewing #sidebar-close { display: block; }
     /* preview overlay */
     #preview-panel {
       position: absolute; inset: 0; background: var(--bg); z-index: 10;
@@ -323,6 +334,10 @@
             <input type="number" id="max_points" step="1" min="2" max="2000" value="500">
             <div class="hint">higher = more detail, bigger STL, more tiles fetched</div>
           </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>Location pins</legend>
           <div class="field">
             <label for="pin_diameter_mm">Pin hole &oslash; (mm)</label>
             <input type="number" id="pin_diameter_mm" step="any" min="0.5" value="2">
@@ -348,16 +363,7 @@
             <input type="number" id="distortion_exponent" step="any">
             <div class="hint">&lt;1 flattens peaks, exaggerates lowlands</div>
           </div>
-          <div class="row">
-            <div class="field">
-              <label for="dn_min">Norm. min (m)</label>
-              <input type="number" id="dn_min" step="any">
-            </div>
-            <div class="field">
-              <label for="dn_max">Norm. max (m)</label>
-              <input type="number" id="dn_max" step="any">
-            </div>
-          </div>
+          <label><input type="checkbox" id="show_bathymetry"> Show bathymetry (sea-floor depth)</label>
         </fieldset>
 
         <fieldset>
@@ -375,9 +381,6 @@
             <input type="text" id="google_api_key" placeholder="AIza&hellip;" autocomplete="off">
             <div class="hint">needs Maps JavaScript API + Elevation API enabled; stored only in this browser</div>
           </div>
-          <fieldset>
-            <label><input type="checkbox" id="show_bathymetry"> Show bathymetry (sea-floor depth)</label>
-          </fieldset>
         </fieldset>
 
         <fieldset>
@@ -388,6 +391,17 @@
             <input type="number" id="min_z_val" step="any">
             <div class="hint">set the same value on every tile so multiple tiled solids share one base height</div>
           </div>
+          <div class="row">
+            <div class="field">
+              <label for="dn_min">Norm. min (m)</label>
+              <input type="number" id="dn_min" step="any">
+            </div>
+            <div class="field">
+              <label for="dn_max">Norm. max (m)</label>
+              <input type="number" id="dn_max" step="any">
+            </div>
+          </div>
+          <div class="hint">normalization pins the distortion range so separate tiles distort identically</div>
         </fieldset>
       </details>
 
@@ -415,6 +429,7 @@
         <h2 id="preview-title">Model</h2>
         <span id="preview-summary"></span>
         <div class="spacer"></div>
+        <button class="close" id="preview-edit">Edit model</button>
         <a class="dl" id="download" download="toporama.stl">Download STL</a>
         <button class="close" id="preview-close">Back to map</button>
       </header>
@@ -439,9 +454,9 @@
         "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
     } }
   </script>
-  <script src="topocore.js?v=28"></script>
-  <script src="elevation.js?v=28"></script>
-  <script src="elevation-google.js?v=28"></script>
-  <script type="module" src="app.js?v=28"></script>
+  <script src="topocore.js?v=29"></script>
+  <script src="elevation.js?v=29"></script>
+  <script src="elevation-google.js?v=29"></script>
+  <script type="module" src="app.js?v=29"></script>
 </body>
 </html>
