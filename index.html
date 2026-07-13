@@ -122,6 +122,20 @@
     #preview-panel a.dl { background: var(--accent); color: #fff; }
     #preview-panel button.close { background: #fff; border: 1.5px solid var(--accent); color: var(--accent); }
     #viewer { flex: 1; min-height: 0; }
+    #view-opts {
+      position: absolute; top: 66px; left: 16px; z-index: 3;
+      background: rgba(250,247,242,0.92); border: 1px solid var(--line);
+      border-radius: 8px; padding: 8px 10px; font-size: 11px; color: var(--muted);
+      display: flex; flex-direction: column; gap: 6px; width: 170px;
+    }
+    #view-opts .seg { display: flex; border: 1px solid var(--accent); border-radius: 6px; overflow: hidden; }
+    #view-opts .seg button {
+      flex: 1; border: none; background: #fff; color: var(--accent);
+      font-size: 11px; font-weight: 600; padding: 4px 0; cursor: pointer;
+    }
+    #view-opts .seg button.on { background: var(--accent); color: #fff; }
+    #view-opts label { display: block; }
+    #view-opts input[type=range] { width: 100%; accent-color: var(--accent); margin: 1px 0 0; }
     #preview-meta { padding: 10px 20px 20px; overflow-y: auto; max-height: 40%; }
     .check { display: flex; gap: 10px; align-items: baseline; font-size: 13px; padding: 4px 0; border-bottom: 1px solid var(--line); }
     .check .level { min-width: 46px; text-align: center; font-size: 11px; font-weight: 700; border-radius: 999px; padding: 1px 8px; }
@@ -264,18 +278,6 @@
           <input type="number" id="model_height_cm" step="any" min="1" max="55" disabled>
         </div>
       </div>
-      <div class="field">
-        <label for="model_thickness_cm">Thickness (cm)</label>
-        <input type="number" id="model_thickness_cm" step="any" min="0.5">
-        <div class="hint">distorts elevation so the model has this height</div>
-      </div>
-      <div class="or-divider">— or —</div>
-      <div class="field">
-        <label for="elevation_distortion">Elevation distortion</label>
-        <input type="number" id="elevation_distortion" step="any" min="0.01" value="2">
-        <div class="hint">1.0 = true scale; try 1.5–3 for subtle terrain</div>
-      </div>
-
       <fieldset>
         <legend>Style</legend>
         <label><input type="radio" name="toporama-style" value="plain" checked> Plain (thin walls, most plastics)</label>
@@ -284,6 +286,17 @@
 
       <details>
         <summary>Advanced options</summary>
+        <div class="field">
+          <label for="elevation_distortion">Elevation distortion</label>
+          <input type="number" id="elevation_distortion" step="any" min="0.01" placeholder="2">
+          <div class="hint">1.0 = true scale; defaults to 2 — tune it live on the preview sliders</div>
+        </div>
+        <div class="or-divider">— or —</div>
+        <div class="field">
+          <label for="model_thickness_cm">Thickness (cm)</label>
+          <input type="number" id="model_thickness_cm" step="any" min="0.5">
+          <div class="hint">distorts elevation so the model has this height</div>
+        </div>
         <fieldset>
           <legend>Set box by coordinates</legend>
           <div class="row">
@@ -371,6 +384,15 @@
         <button class="close" id="preview-close">Back to map</button>
       </header>
       <canvas id="viewer"></canvas>
+      <div id="view-opts">
+        <div class="seg">
+          <button type="button" data-shade="smooth" class="on">smooth</button>
+          <button type="button" data-shade="flat">flat</button>
+          <button type="button" data-shade="wire">wire</button>
+        </div>
+        <label>light direction <input type="range" id="light-az" min="0" max="360" step="5" value="45"></label>
+        <label>light height <input type="range" id="light-alt" min="10" max="80" step="5" value="60"></label>
+      </div>
       <div id="preview-meta"></div>
     </div>
   </div>
@@ -382,8 +404,8 @@
         "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
     } }
   </script>
-  <script src="topocore.js?v=24"></script>
-  <script src="elevation.js?v=24"></script>
-  <script type="module" src="app.js?v=24"></script>
+  <script src="topocore.js?v=26"></script>
+  <script src="elevation.js?v=26"></script>
+  <script type="module" src="app.js?v=26"></script>
 </body>
 </html>

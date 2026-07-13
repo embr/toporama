@@ -355,8 +355,9 @@ function makeMutex(aId, bId) {
   });
 }
 function maybeEnableBuild() {
-  var ok = bounds && $('model_width_cm').value !== '' &&
-    ($('model_thickness_cm').value !== '' || $('elevation_distortion').value !== '');
+  // only a box and a width are required; z scaling defaults to
+  // distortion 2 and lives under Advanced options / the preview sliders
+  var ok = bounds && $('model_width_cm').value !== '';
   $('build').disabled = !ok;
 }
 function numOrNull(id) { var v = $(id).value; return v === '' ? null : parseFloat(v); }
@@ -385,7 +386,7 @@ function buildModelConfig() {
   var thickness = numOrNull('model_thickness_cm');
   var distortion = numOrNull('elevation_distortion');
   if (thickness !== null) model.output_z_meters = thickness / 100;
-  else model.output_z_distortion = distortion;
+  else model.output_z_distortion = (distortion !== null ? distortion : 2);
   var mz = numOrNull('min_z_val'); model.min_z_val = (mz === null ? null : mz);
   var de = numOrNull('distortion_exponent'); if (de !== null) model.distortion_exponent = de;
   var dnmin = numOrNull('dn_min'); if (dnmin !== null) model.distortion_normalization_min = dnmin;
@@ -528,6 +529,23 @@ function doBuild() {
 
 // ---- preview (three.js) + download ------------------------------------
 var viewerState = null;
+
+// viewer display prefs: survive re-meshes and re-builds. 'flat' shades
+// each triangle as a facet (shows the exact mesh, boosts contrast),
+// 'wire' draws the triangle edges. The light angles give raking light —
+// a low sun makes subtle relief pop, hillshade-style.
+var viewPrefs = { shade: 'smooth', az: 45, alt: 60 };
+
+function applyViewPrefs() {
+  if (!viewerState || !viewerState.mat) return;
+  var m = viewerState.mat;
+  m.flatShading = viewPrefs.shade !== 'smooth';
+  m.wireframe = viewPrefs.shade === 'wire';
+  m.needsUpdate = true;
+  var az = viewPrefs.az * Math.PI / 180, alt = viewPrefs.alt * Math.PI / 180;
+  viewerState.key.position.set(
+    Math.cos(az) * Math.cos(alt), Math.sin(az) * Math.cos(alt), Math.sin(alt));
+}
 function showPreview(d, preserveView) {
   $('preview-title').textContent = d.model.name;
   $('preview-summary').textContent = 'printability: ' + d.summary;
@@ -726,7 +744,9 @@ async function renderMesh(positionsBuf, indicesBuf, preserveView) {
   }
   viewerState = { renderer: renderer, raf: 0, mesh: mesh,
                   camera: camera, controls: controls,
-                  baseMinZ: geom.boundingBox.min.z };
+                  baseMinZ: geom.boundingBox.min.z,
+                  mat: mat, key: key };
+  applyViewPrefs();
   animate();
 }
 
@@ -774,6 +794,22 @@ document.addEventListener('DOMContentLoaded', function () {
     e.preventDefault();
     closeSidebar();   // let the build/preview overlay take the screen
     doBuild();
+  });
+  // viewer display options (shading mode + light direction)
+  document.querySelectorAll('#view-opts .seg button').forEach(function (b) {
+    b.addEventListener('click', function () {
+      viewPrefs.shade = b.getAttribute('data-shade');
+      document.querySelectorAll('#view-opts .seg button').forEach(function (o) {
+        o.classList.toggle('on', o === b);
+      });
+      applyViewPrefs();
+    });
+  });
+  $('light-az').addEventListener('input', function () {
+    viewPrefs.az = parseFloat($('light-az').value); applyViewPrefs();
+  });
+  $('light-alt').addEventListener('input', function () {
+    viewPrefs.alt = parseFloat($('light-alt').value); applyViewPrefs();
   });
   $('preview-close').addEventListener('click', function () {
     // back to the map with the box, handles, and pins exactly as they were
