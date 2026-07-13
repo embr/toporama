@@ -434,22 +434,38 @@ function remesh(fields) {
   }
   lastBuild.model = model2;
   var world2 = lastBuild.world.slice();
-  var sum = $('preview-summary');
-  sum.textContent = 're-meshing…';
+  // busy state: announce, grey out and lock the sliders so a second
+  // adjustment can't pile onto an in-flight re-mesh
+  $('preview-summary').textContent = 're-meshing…';
+  setTuneBusy(true);
   var worker = new Worker('worker.js');
   worker.onmessage = function (ev) {
     var d = ev.data;
     worker.terminate();
-    if (!d.ok) { showError('Re-mesh failed: ' + d.error); return; }
+    if (!d.ok) {
+      setTuneBusy(false);
+      showError('Re-mesh failed: ' + d.error);
+      return;
+    }
     d.grid_spacing_m = lastBuild.gridSpacing;
     d.resolution = lastBuild.resolution;
     d.zoom = lastBuild.zoom;
     d.model = model2;
-    showPreview(d);
+    showPreview(d, true);   // true: keep the camera pose for an A/B diff
   };
-  worker.onerror = function (er) { showError('Worker error: ' + er.message); };
+  worker.onerror = function (er) {
+    setTuneBusy(false);
+    showError('Worker error: ' + er.message);
+  };
   worker.postMessage({ model: model2, world: world2.buffer,
     m: lastBuild.m, n: lastBuild.n }, [world2.buffer]);
+}
+
+function setTuneBusy(on) {
+  var tune = document.querySelector('.tune');
+  if (!tune) return;
+  tune.classList.toggle('busy', on);
+  tune.querySelectorAll('input').forEach(function (i) { i.disabled = on; });
 }
 
 function doBuild() {
@@ -512,7 +528,7 @@ function doBuild() {
 
 // ---- preview (three.js) + download ------------------------------------
 var viewerState = null;
-function showPreview(d) {
+function showPreview(d, preserveView) {
   $('preview-title').textContent = d.model.name;
   $('preview-summary').textContent = 'printability: ' + d.summary;
 
@@ -534,18 +550,42 @@ function showPreview(d) {
     var exp0 = d.model.distortion_exponent || 1;
     var tune = document.createElement('div');
     tune.className = 'tune';
+    // slider + tick row; the identity tick (value 1 = untransformed) is
+    // accented and clickable as a one-tap reset
+    function sliderHTML(id, label, min, max, step, val, ticks) {
+      var h = '<label>' + label + ' <b id="' + id + '-val">' + val + '</b>' +
+        '<input type="range" id="' + id + '" min="' + min + '" max="' + max +
+        '" step="' + step + '" value="' + val + '"><span class="ticks">';
+      ticks.forEach(function (t) {
+        var pct = ((t - min) / (max - min) * 100).toFixed(2);
+        h += t === 1
+          ? '<i class="tick identity" data-for="' + id + '" title="reset to 1 (no transform)" style="left:' + pct + '%"></i>'
+          : '<i class="tick" style="left:' + pct + '%"></i>';
+      });
+      return h + '</span></label>';
+    }
     tune.innerHTML =
-      '<label>elevation distortion <b id="tune-dist-val">' + dist0 + '</b>' +
-      '<input type="range" id="tune-dist" min="0.25" max="6" step="0.05" value="' + dist0 + '"></label>' +
-      '<label>peak-flattening exponent <b id="tune-exp-val">' + exp0 + '</b>' +
-      '<input type="range" id="tune-exp" min="0.3" max="2" step="0.05" value="' + exp0 + '"></label>';
+      sliderHTML('tune-dist', 'elevation distortion', 0, 20, 0.1, dist0,
+        [0, 1, 5, 10, 15, 20]) +
+      sliderHTML('tune-exp', 'peak-flattening exponent', 0, 2, 0.05, exp0,
+        [0, 0.5, 1, 1.5, 2]);
     meta.appendChild(tune);
     var sd = tune.querySelector('#tune-dist'), se = tune.querySelector('#tune-exp');
+    // identity ticks reset their slider to 1 and apply it
+    tune.querySelectorAll('.tick.identity').forEach(function (t) {
+      t.addEventListener('click', function () {
+        var input = tune.querySelector('#' + t.getAttribute('data-for'));
+        if (input.disabled) return;
+        input.value = 1;
+        input.dispatchEvent(new Event('input'));
+        input.dispatchEvent(new Event('change'));
+      });
+    });
     sd.addEventListener('input', function () {
       $('tune-dist-val').textContent = sd.value;
       // live approximation: scale the rendered mesh in z (bases/walls
       // stretch a little too — the release re-mesh makes it exact)
-      if (viewerState && viewerState.mesh)
+      if (viewerState && viewerState.mesh && dist0 > 0)
         viewerState.mesh.scale.z = parseFloat(sd.value) / dist0;
     });
     sd.addEventListener('change', function () {
@@ -588,7 +628,7 @@ function showPreview(d) {
   meta.appendChild(dl2);
 
   $('preview-panel').style.display = 'flex';
-  renderMesh(d.positions, d.indices).catch(function (err) {
+  renderMesh(d.positions, d.indices, preserveView).catch(function (err) {
     $('preview-meta').insertAdjacentHTML('afterbegin',
       '<div class="msg info" style="display:block">3D preview unavailable (' +
       (err && err.message ? err.message : err) + '). Your STL is ready to ' +
@@ -596,13 +636,22 @@ function showPreview(d) {
   });
 }
 
-async function renderMesh(positionsBuf, indicesBuf) {
+async function renderMesh(positionsBuf, indicesBuf, preserveView) {
   var THREE = await import('three');
   var OrbitControls = (await import('three/addons/controls/OrbitControls.js')).OrbitControls;
   var canvas = $('viewer');
   var W = canvas.clientWidth || canvas.parentElement.clientWidth;
   var H = canvas.clientHeight || 360;
 
+  // capture the old camera pose BEFORE tearing the viewer down, so a
+  // slider re-mesh renders from the exact same viewpoint (in-place diff)
+  var savedView = null;
+  if (preserveView && viewerState && viewerState.camera) {
+    savedView = {
+      pos: viewerState.camera.position.clone(),
+      target: viewerState.controls.target.clone()
+    };
+  }
   if (viewerState) { viewerState.renderer.dispose(); cancelAnimationFrame(viewerState.raf); }
 
   var renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true });
@@ -634,7 +683,12 @@ async function renderMesh(positionsBuf, indicesBuf) {
   var radius = Math.max(size.x, size.y, size.z);
   camera.position.set(0, -radius * 1.3, radius * 0.9);
   camera.lookAt(0, 0, 0);
-  var controls = new OrbitControls(camera, canvas); controls.update();
+  var controls = new OrbitControls(camera, canvas);
+  if (savedView) {
+    camera.position.copy(savedView.pos);
+    controls.target.copy(savedView.target);
+  }
+  controls.update();
 
   function animate() {
     var raf = requestAnimationFrame(animate);
@@ -647,7 +701,8 @@ async function renderMesh(positionsBuf, indicesBuf) {
     controls.update();
     renderer.render(scene, camera);
   }
-  viewerState = { renderer: renderer, raf: 0, mesh: mesh };
+  viewerState = { renderer: renderer, raf: 0, mesh: mesh,
+                  camera: camera, controls: controls };
   animate();
 }
 

@@ -466,7 +466,21 @@
     }
     var minZs = verticalMinProjection(hull, queryXY);
     var verts = new Float64Array(top.vertices);
-    for (i = 0; i < V; i++) verts[i * 3 + 2] = minZs[i];
+    // The normal-offset hull genuinely thins at convex features (a knife
+    // ridge's offset feathers to less than the shell thickness under the
+    // crest, and even smooth convex curvature loses a percent or two), so
+    // clamp: every interior bottom vertex sits at least minTopThickness
+    // below its top vertex. This only ever ADDS material. Wall vertices
+    // are excluded so the base rim stays a flat plane.
+    var wallMask = getWallVertexMask(top, minSideThickness);
+    for (i = 0; i < V; i++) {
+      var z = minZs[i];
+      if (!wallMask[i]) {
+        var lim = top.vertices[i * 3 + 2] - minTopThickness;
+        if (z > lim) z = lim;
+      }
+      verts[i * 3 + 2] = z;
+    }
     return new Mesh(verts, flipFaces(top.faces));
   }
 
@@ -530,9 +544,14 @@
     }
     var modelHeight = zMax - zMin;
     if (modelHeight <= 0) return [zMin, zMax];
-    var distortedMin = Math.pow(Math.max(zMin, 0), exponent);
-    var distortedMax = Math.pow(zMax, exponent);
-    var distortedHeight = distortedMax - distortedMin;
+    // The transform below works on RELATIVE elevation (z - zMin), so the
+    // correction must renormalize pow's effect on the relative range:
+    // (zMax-zMin)^exponent stretched back to (zMax-zMin). An earlier
+    // version divided by (zMax^e - zMin^e) — computed from ABSOLUTE
+    // elevations — which inflated the output range whenever zMin > 0
+    // (i.e., almost always), making the model and its walls taller than
+    // the terrain's actual min-to-max relief.
+    var distortedHeight = Math.pow(modelHeight, exponent);
     if (distortedHeight <= 0) return [zMin, zMax];
     var correction = modelHeight / distortedHeight;
     for (i = 0; i < N; i++) {
