@@ -135,7 +135,28 @@
     .tune { display: flex; gap: 24px; flex-wrap: wrap; margin: 2px 0 14px; }
     .tune label { flex: 1; min-width: 220px; font-size: 12px; color: var(--muted); }
     .tune label b { color: var(--ink); font-variant-numeric: tabular-nums; margin-left: 4px; }
-    .tune input[type=range] { width: 100%; accent-color: var(--accent); margin-top: 2px; }
+    /* fully custom slider rendering: the tick maths assumes a thumb of
+       exactly 16px, and native thumbs ignore size overrides — so take
+       over drawing entirely (appearance:none) for deterministic geometry */
+    .tune input[type=range] {
+      -webkit-appearance: none; appearance: none; width: 100%; height: 20px;
+      background: transparent; margin: 2px 0 0; padding: 0;
+    }
+    .tune input[type=range]::-webkit-slider-runnable-track {
+      height: 4px; border-radius: 2px; background: #ddd6c8;
+    }
+    .tune input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none; width: 16px; height: 16px; margin-top: -6px;
+      border-radius: 50%; background: var(--accent);
+      box-shadow: 0 1px 2px rgba(0,0,0,0.3); cursor: grab;
+    }
+    .tune input[type=range]::-moz-range-track {
+      height: 4px; border-radius: 2px; background: #ddd6c8;
+    }
+    .tune input[type=range]::-moz-range-thumb {
+      width: 16px; height: 16px; border: none; border-radius: 50%;
+      background: var(--accent); box-shadow: 0 1px 2px rgba(0,0,0,0.3); cursor: grab;
+    }
     .tune.busy { opacity: 0.5; pointer-events: none; animation: tunepulse 1s ease-in-out infinite alternate; }
     .tune .ticks { display: block; position: relative; height: 22px; margin-top: -2px; }
     .tune .tick {
@@ -154,9 +175,6 @@
       font-size: 9px; font-style: normal; color: var(--muted); line-height: 1;
     }
     .tune .tick-num.identity { color: var(--accent); font-weight: 700; cursor: pointer; }
-    /* pin the thumb size so tick calc() positions are exact */
-    .tune input[type=range]::-webkit-slider-thumb { width: 16px; height: 16px; }
-    .tune input[type=range]::-moz-range-thumb { width: 16px; height: 16px; }
     @keyframes tunepulse { from { opacity: 0.5; } to { opacity: 0.75; } }
     #building-overlay {
       position: absolute; inset: 0; background: rgba(250,247,242,0.85); z-index: 8;
@@ -364,8 +382,8 @@
         "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
     } }
   </script>
-  <script src="topocore.js?v=22"></script>
-  <script src="elevation.js?v=22"></script>
-  <script type="module" src="app.js?v=22"></script>
+  <script src="topocore.js?v=24"></script>
+  <script src="elevation.js?v=24"></script>
+  <script type="module" src="app.js?v=24"></script>
 </body>
 </html>

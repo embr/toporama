@@ -597,9 +597,14 @@ function showPreview(d, preserveView) {
     sd.addEventListener('input', function () {
       $('tune-dist-val').textContent = sd.value;
       // live approximation: scale the rendered mesh in z (bases/walls
-      // stretch a little too — the release re-mesh makes it exact)
-      if (viewerState && viewerState.mesh && dist0 > 0)
-        viewerState.mesh.scale.z = parseFloat(sd.value) / dist0;
+      // stretch a little too — the release re-mesh makes it exact).
+      // The position compensation keeps the BASE plane pinned while
+      // scaling, matching the fixed-floor convention of renderMesh.
+      if (viewerState && viewerState.mesh && dist0 > 0) {
+        var f = parseFloat(sd.value) / dist0;
+        viewerState.mesh.scale.z = f;
+        viewerState.mesh.position.z = -viewerState.baseMinZ * f;
+      }
     });
     sd.addEventListener('change', function () {
       var v = parseFloat(sd.value);
@@ -690,13 +695,18 @@ async function renderMesh(positionsBuf, indicesBuf, preserveView) {
 
   var mat = new THREE.MeshStandardMaterial({ color: 0xd9c9a8, metalness: 0.05, roughness: 0.85 });
   var mesh = new THREE.Mesh(geom, mat);
-  mesh.position.sub(center);
+  // anchor the BASE plane at world z=0 (x/y centered): models of different
+  // heights (e.g. slider re-meshes) then share a fixed floor, so a
+  // preserved camera really compares them from the same viewpoint
+  // relative to the table the model "stands on"
+  mesh.position.set(-center.x, -center.y, -geom.boundingBox.min.z);
   scene.add(mesh);
 
   var radius = Math.max(size.x, size.y, size.z);
-  camera.position.set(0, -radius * 1.3, radius * 0.9);
-  camera.lookAt(0, 0, 0);
+  camera.position.set(0, -radius * 1.3, radius * 0.9 + size.z / 2);
+  camera.lookAt(0, 0, size.z / 2);
   var controls = new OrbitControls(camera, canvas);
+  controls.target.set(0, 0, size.z / 2);
   if (savedView) {
     camera.position.copy(savedView.pos);
     controls.target.copy(savedView.target);
@@ -715,7 +725,8 @@ async function renderMesh(positionsBuf, indicesBuf, preserveView) {
     renderer.render(scene, camera);
   }
   viewerState = { renderer: renderer, raf: 0, mesh: mesh,
-                  camera: camera, controls: controls };
+                  camera: camera, controls: controls,
+                  baseMinZ: geom.boundingBox.min.z };
   animate();
 }
 
