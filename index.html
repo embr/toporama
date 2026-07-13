@@ -52,7 +52,7 @@
       border: 1px solid var(--line); border-radius: 6px; background: #fff;
     }
     .field input:disabled { background: #f0ece4; color: #999; }
-    .field .hint { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    .hint { font-size: 11px; color: var(--muted); margin-top: 2px; }
     .row { display: flex; gap: 10px; }
     .row .field { flex: 1; }
     .or-divider { text-align: center; font-size: 11px; color: var(--muted); margin: -4px 0 8px; }
@@ -72,6 +72,7 @@
     fieldset { border: 1px solid var(--line); border-radius: 8px; margin: 0 0 13px; padding: 8px 12px 10px; }
     fieldset legend { font-size: 12px; color: var(--muted); padding: 0 4px; }
     fieldset label { display: block; font-size: 13px; margin: 4px 0; }
+    fieldset label:has(input[type=checkbox]) { font-size: 12px; color: var(--muted); }
     details { margin-bottom: 14px; }
     details summary { font-size: 12px; color: var(--muted); cursor: pointer; margin-bottom: 8px; }
     #map-container { position: relative; flex: 1; height: 100%; }
@@ -454,9 +455,9 @@
         "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
     } }
   </script>
-  <script src="topocore.js?v=29"></script>
-  <script src="elevation.js?v=29"></script>
-  <script src="elevation-google.js?v=29"></script>
-  <script type="module" src="app.js?v=29"></script>
+  <script src="topocore.js?v=30"></script>
+  <script src="elevation.js?v=30"></script>
+  <script src="elevation-google.js?v=30"></script>
+  <script type="module" src="app.js?v=30"></script>
 </body>
 </html>
