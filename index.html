@@ -137,16 +137,26 @@
     .tune label b { color: var(--ink); font-variant-numeric: tabular-nums; margin-left: 4px; }
     .tune input[type=range] { width: 100%; accent-color: var(--accent); margin-top: 2px; }
     .tune.busy { opacity: 0.5; pointer-events: none; animation: tunepulse 1s ease-in-out infinite alternate; }
-    .tune .ticks { display: block; position: relative; height: 10px; margin-top: -2px; }
+    .tune .ticks { display: block; position: relative; height: 22px; margin-top: -2px; }
     .tune .tick {
       position: absolute; top: 0; width: 1px; height: 5px;
       background: #c9c2b4; transform: translateX(-0.5px);
     }
     .tune .tick.identity {
-      width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
-      transform: translate(-3.5px, -1px); cursor: pointer;
+      /* 7px visible dot inside a 19px transparent hit area (finger-friendly) */
+      width: 19px; height: 19px; border: 6px solid transparent;
+      border-radius: 50%; background: var(--accent); background-clip: padding-box;
+      transform: translate(-9.5px, -7px); cursor: pointer;
     }
     .tune .tick.identity:hover { box-shadow: 0 0 0 3px rgba(176,92,42,0.25); }
+    .tune .tick-num {
+      position: absolute; top: 8px; transform: translateX(-50%);
+      font-size: 9px; font-style: normal; color: var(--muted); line-height: 1;
+    }
+    .tune .tick-num.identity { color: var(--accent); font-weight: 700; cursor: pointer; }
+    /* pin the thumb size so tick calc() positions are exact */
+    .tune input[type=range]::-webkit-slider-thumb { width: 16px; height: 16px; }
+    .tune input[type=range]::-moz-range-thumb { width: 16px; height: 16px; }
     @keyframes tunepulse { from { opacity: 0.5; } to { opacity: 0.75; } }
     #building-overlay {
       position: absolute; inset: 0; background: rgba(250,247,242,0.85); z-index: 8;
@@ -354,8 +364,8 @@
         "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
     } }
   </script>
-  <script src="topocore.js?v=20"></script>
-  <script src="elevation.js?v=20"></script>
-  <script type="module" src="app.js?v=20"></script>
+  <script src="topocore.js?v=22"></script>
+  <script src="elevation.js?v=22"></script>
+  <script type="module" src="app.js?v=22"></script>
 </body>
 </html>

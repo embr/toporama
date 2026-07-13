@@ -551,16 +551,25 @@ function showPreview(d, preserveView) {
     var tune = document.createElement('div');
     tune.className = 'tune';
     // slider + tick row; the identity tick (value 1 = untransformed) is
-    // accented and clickable as a one-tap reset
+    // accented and clickable as a one-tap reset.
+    // Tick positions must match the THUMB's center, which travels from
+    // thumbW/2 to (100% - thumbW/2) — not the full track — so plain
+    // percentage lefts drift near the ends (worst at the distortion
+    // slider's identity mark, at 5% of the range). The calc() below maps
+    // the fraction onto the thumb-center span; the thumb width is pinned
+    // to 16px in CSS so this is exact rather than browser-dependent.
     function sliderHTML(id, label, min, max, step, val, ticks) {
       var h = '<label>' + label + ' <b id="' + id + '-val">' + val + '</b>' +
         '<input type="range" id="' + id + '" min="' + min + '" max="' + max +
         '" step="' + step + '" value="' + val + '"><span class="ticks">';
       ticks.forEach(function (t) {
-        var pct = ((t - min) / (max - min) * 100).toFixed(2);
+        var frac = (t - min) / (max - min);
+        var pos = 'left:calc(' + frac.toFixed(4) + ' * (100% - 16px) + 8px)';
         h += t === 1
-          ? '<i class="tick identity" data-for="' + id + '" title="reset to 1 (no transform)" style="left:' + pct + '%"></i>'
-          : '<i class="tick" style="left:' + pct + '%"></i>';
+          ? '<i class="tick identity" data-for="' + id + '" title="reset to 1 (no transform)" style="' + pos + '"></i>' +
+            '<em class="tick-num identity" data-for="' + id + '" title="reset to 1 (no transform)" style="' + pos + '">1</em>'
+          : '<i class="tick" style="' + pos + '"></i>' +
+            '<em class="tick-num" style="' + pos + '">' + t + '</em>';
       });
       return h + '</span></label>';
     }
@@ -571,9 +580,13 @@ function showPreview(d, preserveView) {
         [0, 0.5, 1, 1.5, 2]);
     meta.appendChild(tune);
     var sd = tune.querySelector('#tune-dist'), se = tune.querySelector('#tune-exp');
-    // identity ticks reset their slider to 1 and apply it
-    tune.querySelectorAll('.tick.identity').forEach(function (t) {
-      t.addEventListener('click', function () {
+    // identity ticks (dot and its number) reset their slider to 1 and apply
+    // it. preventDefault stops the surrounding <label> from forwarding the
+    // click to the range input, which would swallow the reset.
+    tune.querySelectorAll('.identity[data-for]').forEach(function (t) {
+      t.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
         var input = tune.querySelector('#' + t.getAttribute('data-for'));
         if (input.disabled) return;
         input.value = 1;
