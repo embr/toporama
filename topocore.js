@@ -1057,6 +1057,224 @@
     for (i = 0; i < V; i++) for (k = 0; k < 3; k++) v[i * 3 + k] -= mn[k];
   }
 
+  // Planar texture coordinates: each vertex's XY position normalized onto
+  // the mesh's XY bounding box. Shared by the X3D export and the three.js
+  // preview drape so the two always agree. vertices: flat array (x,y,z)*V.
+  function computeUVs(vertices) {
+    var V = Math.floor(vertices.length / 3), i;
+    var mnX = Infinity, mxX = -Infinity, mnY = Infinity, mxY = -Infinity;
+    for (i = 0; i < V; i++) {
+      var x = vertices[i * 3], y = vertices[i * 3 + 1];
+      if (x < mnX) mnX = x; if (x > mxX) mxX = x;
+      if (y < mnY) mnY = y; if (y > mxY) mxY = y;
+    }
+    var rX = (mxX - mnX) || 1, rY = (mxY - mnY) || 1;
+    var uv = new Float32Array(V * 2);
+    for (i = 0; i < V; i++) {
+      uv[i * 2] = (vertices[i * 3] - mnX) / rX;
+      uv[i * 2 + 1] = (vertices[i * 3 + 1] - mnY) / rY;
+    }
+    return uv;
+  }
+
+  // --- X3D color export -------------------------------------------------
+  // Port of the original Python x3d.write_x3d_with_overlay(): one Shape
+  // holding an IndexedFaceSet whose TextureCoordinates are a planar
+  // projection of each vertex's XY position onto the mesh's bounding box,
+  // plus an ImageTexture referencing an external image by (relative)
+  // filename. Shapeways' color pipeline expects the .x3d and its texture
+  // zipped together flat (no folders), with exact case-sensitive filename
+  // matches. Vertices are written in the mesh's own units (meters), the
+  // convention the original uploads used.
+  //
+  // Axis convention: the mesh is Z-up (z = elevation) but X3D/VRML is
+  // Y-up by spec, so vertices are rotated -90 degrees about X on the way
+  // out — (x, y, z) -> (x, z, maxY - y), a proper rotation (winding
+  // preserved) plus a shift keeping the model in the positive octant.
+  // Viewers and Shapeways' preview then show "top" as actual top.
+  function exportX3D(mesh, textureFname, scale) {
+    if (scale === undefined) scale = 1;
+    var v = mesh.vertices, f = mesh.faces;
+    var V = mesh.numVertices(), F = mesh.numFaces();
+    var i, k, val;
+    var mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+    for (i = 0; i < V; i++) for (k = 0; k < 3; k++) {
+      val = v[i * 3 + k] * scale;
+      if (val < mn[k]) mn[k] = val;
+      if (val > mx[k]) mx[k] = val;
+    }
+    var rangeX = (mx[0] - mn[0]) || 1;
+    var rangeY = (mx[1] - mn[1]) || 1;
+
+    var faceStrs = new Array(F);
+    for (i = 0; i < F; i++)
+      faceStrs[i] = f[i * 3] + ' ' + f[i * 3 + 1] + ' ' + f[i * 3 + 2] + ' -1';
+
+    var vertStrs = new Array(V);
+    var uvStrs = textureFname ? new Array(V) : null;
+    for (i = 0; i < V; i++) {
+      var x = v[i * 3] * scale, y = v[i * 3 + 1] * scale, z = v[i * 3 + 2] * scale;
+      // Z-up -> Y-up (see note above)
+      vertStrs[i] = x.toFixed(7) + ' ' + z.toFixed(7) + ' ' + (mx[1] - y).toFixed(7);
+      if (uvStrs)
+        uvStrs[i] = ((x - mn[0]) / rangeX).toFixed(7) + ' ' +
+                    ((y - mn[1]) / rangeY).toFixed(7);
+    }
+
+    var centerOfRotation = ((mx[0] - mn[0]) / 2).toFixed(7) + ' ' +
+      ((mx[2] - mn[2]) / 2).toFixed(7) + ' ' + ((mx[1] - mn[1]) / 2).toFixed(7);
+
+    var parts = [];
+    parts.push('<?xml version="1.0" encoding="utf-8"?>\n');
+    parts.push('<X3D profile="Interchange" version="3.3">\n');
+    parts.push('  <Scene>\n');
+    parts.push('    <Viewpoint id="viewpoint_front" position=".1 .1 .1" ' +
+      'orientation="0 0 0 1" description="camera" centerOfRotation="' +
+      centerOfRotation + '"/>\n');
+    parts.push('    <Shape>\n');
+    parts.push('      <IndexedFaceSet normalPerVertex="false" solid="false" coordIndex="');
+    parts.push(faceStrs.join(', '));
+    parts.push('">\n');
+    parts.push('        <Coordinate point="');
+    parts.push(vertStrs.join(', '));
+    parts.push('"/>\n');
+    if (uvStrs) {
+      parts.push('        <TextureCoordinate point="');
+      parts.push(uvStrs.join(', '));
+      parts.push('"/>\n');
+    }
+    parts.push('      </IndexedFaceSet>\n');
+    parts.push('      <Appearance>\n');
+    if (textureFname) {
+      parts.push('        <ImageTexture url="' + textureFname +
+        '" repeatS="false" repeatT="false"/>\n');
+      // ambientIntensity lets the white base show through unlit areas
+      parts.push('        <Material ambientIntensity="0.5" shininess="0.5"/>\n');
+    } else {
+      parts.push('        <Material diffuseColor="0.980392 0.921569 0.843137"/>\n');
+    }
+    parts.push('      </Appearance>\n');
+    parts.push('    </Shape>\n');
+    parts.push('  </Scene>\n');
+    parts.push('</X3D>\n');
+    return parts.join('');
+  }
+
+  // --- minimal ZIP writer (store only) ----------------------------------
+  // Shapeways wants color models uploaded as a flat ZIP of the model file
+  // plus its texture. The texture is already compressed (JPEG/PNG) and the
+  // X3D text is a small fraction of the pair, so store (method 0) keeps
+  // this dependency-free. entries: [{name: string, data: Uint8Array}].
+  var CRC_TABLE = null;
+  function crc32(data) {
+    if (!CRC_TABLE) {
+      CRC_TABLE = new Uint32Array(256);
+      for (var n = 0; n < 256; n++) {
+        var c = n;
+        for (var j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+        CRC_TABLE[n] = c >>> 0;
+      }
+    }
+    var crc = 0xFFFFFFFF;
+    for (var i = 0; i < data.length; i++)
+      crc = CRC_TABLE[(crc ^ data[i]) & 0xFF] ^ (crc >>> 8);
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+  }
+
+  // items: [{name, data (uncompressed), method (0|8), payload}] where
+  // payload is what actually lands in the archive (== data for store)
+  function assembleZip(items) {
+    // fixed timestamp (2026-01-01 00:00): reproducible output, and some
+    // unzip tools reject the all-zeros DOS date
+    var dosTime = 0, dosDate = ((2026 - 1980) << 9) | (1 << 5) | 1;
+    var encoder = new TextEncoder();
+    var locals = [], centrals = [], offset = 0, i;
+    for (i = 0; i < items.length; i++) {
+      var name = encoder.encode(items[i].name);
+      var data = items[i].data, payload = items[i].payload, method = items[i].method;
+      var crc = crc32(data);                 // CRC is over the UNcompressed data
+      var local = new Uint8Array(30 + name.length);
+      var dv = new DataView(local.buffer);
+      dv.setUint32(0, 0x04034b50, true);     // local file header
+      dv.setUint16(4, 20, true);             // version needed
+      dv.setUint16(6, 0, true);              // flags
+      dv.setUint16(8, method, true);         // 0 = store, 8 = deflate
+      dv.setUint16(10, dosTime, true);
+      dv.setUint16(12, dosDate, true);
+      dv.setUint32(14, crc, true);
+      dv.setUint32(18, payload.length, true);  // compressed size
+      dv.setUint32(22, data.length, true);     // uncompressed size
+      dv.setUint16(26, name.length, true);
+      dv.setUint16(28, 0, true);             // extra length
+      local.set(name, 30);
+      locals.push(local, payload);
+
+      var central = new Uint8Array(46 + name.length);
+      dv = new DataView(central.buffer);
+      dv.setUint32(0, 0x02014b50, true);     // central directory header
+      dv.setUint16(4, 20, true);             // version made by
+      dv.setUint16(6, 20, true);             // version needed
+      dv.setUint16(8, 0, true);
+      dv.setUint16(10, method, true);
+      dv.setUint16(12, dosTime, true);
+      dv.setUint16(14, dosDate, true);
+      dv.setUint32(16, crc, true);
+      dv.setUint32(20, payload.length, true);
+      dv.setUint32(24, data.length, true);
+      dv.setUint16(28, name.length, true);
+      // extra/comment/disk/attrs left zero
+      dv.setUint32(42, offset, true);        // local header offset
+      central.set(name, 46);
+      centrals.push(central);
+      offset += local.length + payload.length;
+    }
+    var centralSize = 0;
+    for (i = 0; i < centrals.length; i++) centralSize += centrals[i].length;
+    var eocd = new Uint8Array(22);
+    var edv = new DataView(eocd.buffer);
+    edv.setUint32(0, 0x06054b50, true);      // end of central directory
+    edv.setUint16(8, items.length, true);
+    edv.setUint16(10, items.length, true);
+    edv.setUint32(12, centralSize, true);
+    edv.setUint32(16, offset, true);
+    var out = new Uint8Array(offset + centralSize + 22);
+    var pos = 0;
+    var chunks = locals.concat(centrals, [eocd]);
+    for (i = 0; i < chunks.length; i++) { out.set(chunks[i], pos); pos += chunks[i].length; }
+    return out;
+  }
+
+  function makeStoredZip(entries) {
+    return assembleZip(entries.map(function (e) {
+      return { name: e.name, data: e.data, payload: e.data, method: 0 };
+    }));
+  }
+
+  // Async variant: deflates entries with the native CompressionStream when
+  // the platform has it (all current browsers + node 18+), falling back to
+  // store. Matters here because X3D is verbose text — a large model's XML
+  // shrinks ~10x, keeping the zip under Shapeways' 64 MB upload cap.
+  function makeZip(entries) {
+    function deflateRaw(data) {
+      if (typeof CompressionStream === 'undefined') return Promise.resolve(null);
+      try {
+        var stream = new Blob([data]).stream()
+          .pipeThrough(new CompressionStream('deflate-raw'));
+        return new Response(stream).arrayBuffer()
+          .then(function (b) { return new Uint8Array(b); })
+          .catch(function () { return null; });
+      } catch (e) { return Promise.resolve(null); }
+    }
+    return Promise.all(entries.map(function (e) {
+      return deflateRaw(e.data).then(function (comp) {
+        var useDeflate = comp && comp.length < e.data.length;
+        return { name: e.name, data: e.data,
+                 payload: useDeflate ? comp : e.data,
+                 method: useDeflate ? 8 : 0 };
+      });
+    })).then(assembleZip);
+  }
+
   return {
     project: project,
     unproject: unproject,
@@ -1086,6 +1304,10 @@
     checkShell: checkShell,
     summarize: summarize,
     exportSTL: exportSTL,
+    computeUVs: computeUVs,
+    exportX3D: exportX3D,
+    makeStoredZip: makeStoredZip,
+    makeZip: makeZip,
     boundingSizeMM: boundingSizeMM,
     centerAtOrigin: centerAtOrigin
   };

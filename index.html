@@ -135,6 +135,7 @@
       text-decoration: none; cursor: pointer; border: none;
     }
     #preview-panel a.dl { background: var(--accent); color: #fff; }
+    #preview-panel a.dl.busy { opacity: .55; pointer-events: none; }
     #preview-panel button.close { background: #fff; border: 1.5px solid var(--accent); color: var(--accent); }
     #viewer { flex: 1; min-height: 0; }
     #view-opts {
@@ -298,6 +299,12 @@
         <label><input type="radio" name="toporama-style" value="plain" checked> Plain (thin walls, most plastics)</label>
         <label><input type="radio" name="toporama-style" value="sandstone"> Extra sturdy (thick walls)</label>
       </fieldset>
+      <fieldset>
+        <legend>Surface</legend>
+        <label><input type="checkbox" id="overlay"> Satellite image overlay (full-color printing)</label>
+        <div class="hint">drapes aerial imagery over the model — the preview shows it, and the
+          download becomes a color X3D&nbsp;+&nbsp;texture zip for Shapeways' full-color materials</div>
+      </fieldset>
 
       <details>
         <summary>Advanced options</summary>
@@ -455,9 +462,9 @@
         "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
     } }
   </script>
-  <script src="topocore.js?v=30"></script>
-  <script src="elevation.js?v=30"></script>
-  <script src="elevation-google.js?v=30"></script>
-  <script type="module" src="app.js?v=30"></script>
+  <script src="topocore.js?v=34"></script>
+  <script src="elevation.js?v=34"></script>
+  <script src="elevation-google.js?v=34"></script>
+  <script type="module" src="app.js?v=34"></script>
 </body>
 </html>

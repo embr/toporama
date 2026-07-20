@@ -396,6 +396,7 @@ function buildShareURL() {
   var style = document.querySelector('input[name=toporama-style]:checked').value;
   if (style !== 'plain') q.set('style', style);
   if ($('show_bathymetry').checked) q.set('bath', '1');
+  if ($('overlay').checked) q.set('sat', '1');
   if ($('tiled').checked) q.set('tiled', '1');
   if ($('elev_source').value !== 'aws') q.set('src', $('elev_source').value);
   var pinStr = pins.map(function (p) {
@@ -423,6 +424,7 @@ function applySharedParams() {
     if (r) r.checked = true;
   }
   $('show_bathymetry').checked = q.get('bath') === '1';
+  $('overlay').checked = q.get('sat') === '1';
   $('tiled').checked = q.get('tiled') === '1';
   if (q.get('src')) {
     $('elev_source').value = q.get('src');
@@ -460,7 +462,8 @@ function buildModelConfig() {
     wall_thickness: t.wall_thickness,
     upload_scale: 1,
     tiled: $('tiled').checked,
-    show_bathymetry: $('show_bathymetry').checked
+    show_bathymetry: $('show_bathymetry').checked,
+    overlay: $('overlay').checked
   };
   var thickness = numOrNull('model_thickness_cm');
   var distortion = numOrNull('elevation_distortion');
@@ -488,6 +491,36 @@ function buildModelConfig() {
     };
   }
   return model;
+}
+
+// ---- elevation cache ----------------------------------------------------
+// Elevation for a given (source, box, grid, bathymetry) never changes, so
+// results are memoized for the session. Rebuilding after "Back to map" (or
+// pressing BUILD again from the Edit drawer with the same box) reuses the
+// data instead of re-hitting the tile host / Google API. This is a plain
+// in-memory Map — synchronous, so it can never stall a build. (An earlier
+// attempt also persisted to IndexedDB; in some browser contexts a wedged
+// IndexedDB left indexedDB.open hanging with no event, which froze the
+// build. Memory-only fully covers the go-back-and-edit case with zero
+// hang risk; persistence can be revisited behind a hard guard later.)
+var elevMem = new Map();
+
+function elevKey(model, grid, useGoogle) {
+  return [useGoogle ? 'g' : 'a', model.show_bathymetry ? 1 : 0,
+    grid.m, grid.n, model.north.toFixed(6), model.south.toFixed(6),
+    model.east.toFixed(6), model.west.toFixed(6)].join('|');
+}
+function getElevations(model, grid, useGoogle, fetchOpts, onProgress) {
+  var key = elevKey(model, grid, useGoogle);
+  if (elevMem.has(key)) {
+    log('elevation cache hit');
+    return Promise.resolve(elevMem.get(key));
+  }
+  var fetcher = useGoogle ? TopoElevGoogle : TopoElev;
+  return fetcher.fetchElevations(grid, fetchOpts, onProgress).then(function (elev) {
+    elevMem.set(key, elev);
+    return elev;
+  });
 }
 
 // ---- build orchestration ----------------------------------------------
@@ -568,7 +601,6 @@ function doBuild() {
   // user-keyed Google Elevation API (for regions AWS tiles lack)
   var useGoogle = $('elev_source').value === 'google';
   var fetchOpts = { showBathymetry: model.show_bathymetry };
-  var fetcher = TopoElev;
   if (useGoogle) {
     fetchOpts.apiKey = $('google_api_key').value.trim();
     if (!fetchOpts.apiKey) {
@@ -577,11 +609,10 @@ function doBuild() {
         '(Advanced options → Data source).');
       return;
     }
-    fetcher = TopoElevGoogle;
   }
   var unit = useGoogle ? 'rows' : 'tiles';
 
-  fetcher.fetchElevations(grid, fetchOpts,
+  getElevations(model, grid, useGoogle, fetchOpts,
     function (done, total) {
       setProgress(done / total * 0.6);
       $('building-label').textContent = 'Fetching elevation ' + unit +
@@ -631,6 +662,204 @@ function doBuild() {
   });
 }
 
+// ---- color print file (X3D + satellite texture) ------------------------
+// Port of the original Python color pipeline (x3d.py): plan-view imagery is
+// draped over the solid with planar texture coordinates and the pair is
+// zipped flat, which is exactly what Shapeways' full-color formats expect.
+// The texture is stitched from the same keyless Esri World Imagery tiles
+// the map's satellite layer uses.
+var TopoSat = {
+  tileUrl: function (z, x, y) {
+    return 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/'
+      + z + '/' + y + '/' + x;
+  },
+  loadTile: function (url) {
+    return new Promise(function (resolve, reject) {
+      var img = new Image();
+      img.crossOrigin = 'anonymous';   // canvas must stay readable (CORS)
+      img.onload = function () { resolve(img); };
+      img.onerror = function () { reject(new Error('failed to load an imagery tile')); };
+      img.src = url;
+    });
+  }
+};
+var MAX_TEXTURE_PX = 2048;   // Shapeways caps textures at 2048×2048
+var SAT_MAX_ZOOM = 19;
+
+function lngToXFrac(lng) { return (lng + 180) / 360; }
+function latToYFrac(lat) {
+  var s = Math.sin(lat * Math.PI / 180);
+  return 0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI);
+}
+
+// Stitch imagery tiles covering the model's bbox onto a canvas, then add a
+// white border matching the mesh's flat pad band (the JS twin of the
+// Python pad_image()): the mesh pads x and y by top_pad_width model-meters
+// and the planar UVs span the padded bounds, so the image needs the same
+// proportional border for the drape to line up.
+function stitchSatelliteTexture(model, onProgress) {
+  var xf0 = lngToXFrac(model.west), xf1 = lngToXFrac(model.east);
+  var yf0 = latToYFrac(model.north), yf1 = latToYFrac(model.south);
+  var padFrac = (model.top_pad_width || 0) / model.output_x_meters;
+  var contentMax = Math.floor(MAX_TEXTURE_PX / (1 + 2 * padFrac));
+  var z = SAT_MAX_ZOOM;
+  while (z > 1) {
+    if ((xf1 - xf0) * 256 * Math.pow(2, z) <= contentMax &&
+        (yf1 - yf0) * 256 * Math.pow(2, z) <= contentMax) break;
+    z--;
+  }
+  var worldPx = 256 * Math.pow(2, z);
+  var x0 = xf0 * worldPx, x1 = xf1 * worldPx;
+  var y0 = yf0 * worldPx, y1 = yf1 * worldPx;
+  var w = Math.max(1, Math.round(x1 - x0));
+  var h = Math.max(1, Math.round(y1 - y0));
+  // meters-per-pixel is uniform in mercator, so one pad size fits both axes
+  var padPx = Math.round(w * padFrac);
+  var canvas = document.createElement('canvas');
+  canvas.width = w + 2 * padPx;
+  canvas.height = h + 2 * padPx;
+  var ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  var jobs = [];
+  var tx0 = Math.floor(x0 / 256), tx1 = Math.floor((x1 - 1e-9) / 256);
+  var ty0 = Math.max(0, Math.floor(y0 / 256));
+  var ty1 = Math.min(Math.pow(2, z) - 1, Math.floor((y1 - 1e-9) / 256));
+  for (var ty = ty0; ty <= ty1; ty++)
+    for (var tx = tx0; tx <= tx1; tx++) jobs.push({ tx: tx, ty: ty });
+  var done = 0, nTiles = Math.pow(2, z);
+  return Promise.all(jobs.map(function (j) {
+    var wrappedX = ((j.tx % nTiles) + nTiles) % nTiles;   // antimeridian
+    return TopoSat.loadTile(TopoSat.tileUrl(z, wrappedX, j.ty)).then(function (img) {
+      ctx.drawImage(img, Math.round(j.tx * 256 - x0) + padPx,
+                         Math.round(j.ty * 256 - y0) + padPx);
+      done++;
+      if (onProgress) onProgress(done, jobs.length);
+    });
+  })).then(function () {
+    return new Promise(function (resolve, reject) {
+      canvas.toBlob(function (blob) {
+        if (blob) resolve({ blob: blob, canvas: canvas,
+                            width: canvas.width, height: canvas.height, zoom: z });
+        else reject(new Error('could not encode the texture image'));
+      }, 'image/jpeg', 0.9);
+    });
+  });
+}
+
+// Drape a stitched texture over the three.js preview — the same UVs the
+// X3D export uses, so what you see is what Shapeways prints. Kept (with
+// its bbox) so slider re-meshes over the same box stay draped.
+var lastDrape = null;   // { canvas, key }
+
+function bboxKey(model) {
+  return [model.north, model.south, model.east, model.west].join('|');
+}
+
+function drapePreview(texCanvas) {
+  if (!viewerState || !viewerState.THREE) return false;
+  var THREE = viewerState.THREE;
+  if (typeof THREE.CanvasTexture !== 'function') return false;
+  try {
+    var tex = new THREE.CanvasTexture(texCanvas);
+    if (THREE.SRGBColorSpace !== undefined) tex.colorSpace = THREE.SRGBColorSpace;
+    tex.anisotropy = 4;
+    var m = viewerState.mat;
+    if (m.map && m.map.dispose) m.map.dispose();
+    m.map = tex;
+    if (m.color && m.color.set) m.color.set(0xffffff);
+    m.needsUpdate = true;
+    return true;
+  } catch (e) { return false; }
+}
+
+// ---- color flow state --------------------------------------------------
+// The satellite texture is a function of (bbox, pad fraction) only, so it
+// is stitched once per area and reused across builds and slider re-meshes.
+// The color zip additionally depends on the mesh, so it is built lazily on
+// the first download click after each build and cached until the next one.
+var lastPreview = null;
+var texCache = null;    // { key, canvas, blob }
+var colorZip = null;    // { url, name } — null means (re)build on click
+
+function texKey(model) {
+  var padFrac = (model.top_pad_width || 0) / model.output_x_meters;
+  return bboxKey(model) + '|' + padFrac.toFixed(6);
+}
+
+function ensureTexture(model, onProgress) {
+  var key = texKey(model);
+  if (texCache && texCache.key === key) return Promise.resolve(texCache);
+  return stitchSatelliteTexture(model, onProgress).then(function (tex) {
+    texCache = { key: key, canvas: tex.canvas, blob: tex.blob };
+    return texCache;
+  });
+}
+
+function triggerDownload(url, name) {
+  var a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+// Build <name>_color.zip = flat [<name>.x3d, <name>_texture.jpg], per
+// Shapeways' color-upload rules. The worker hands back vertices in
+// millimeters; the X3D is written in meters like the original uploads.
+function buildColorZip(d, tex) {
+  var base = (d.model.name || 'toporama').replace(/[^a-z0-9]+/gi, '_');
+  var texName = base + '_texture.jpg';
+  var pos = new Float32Array(d.positions);
+  var verts = new Float64Array(pos.length);
+  for (var i = 0; i < pos.length; i++) verts[i] = pos[i] / 1000;  // mm -> m
+  var mesh = new Topo.Mesh(verts, new Uint32Array(d.indices));
+  var x3d = Topo.exportX3D(mesh, texName);
+  return tex.blob.arrayBuffer().then(function (texBuf) {
+    return Topo.makeZip([
+      { name: base + '.x3d', data: new TextEncoder().encode(x3d) },
+      { name: texName, data: new Uint8Array(texBuf) }
+    ]);
+  }).then(function (zip) {
+    var blob = new Blob([zip], { type: 'application/zip' });
+    if (blob.size > 64 * 1024 * 1024)
+      toast('warning: ' + (blob.size / 1e6).toFixed(0) +
+        ' MB zip exceeds the 64 MB upload cap — reduce grid points');
+    return { url: URL.createObjectURL(blob), name: base + '_color.zip' };
+  });
+}
+
+// Single-button download: with the satellite overlay off the anchor is a
+// plain STL link; with it on, the click is intercepted and delivers the
+// color zip instead (built on first click, cached until the next build).
+function onDownloadClick(e) {
+  var d = lastPreview;
+  if (!d || !d.model.overlay) return;   // default: the STL href
+  e.preventDefault();
+  var dl = $('download');
+  if (dl.classList.contains('busy')) return;
+  if (colorZip) { triggerDownload(colorZip.url, colorZip.name); return; }
+  dl.classList.add('busy');
+  var restore = dl.textContent;
+  dl.textContent = 'fetching imagery…';
+  ensureTexture(d.model, function (done, total) {
+    dl.textContent = 'imagery ' + done + '/' + total + '…';
+  }).then(function (tex) {
+    dl.textContent = 'writing X3D…';
+    // let the label paint before the (potentially large) string build
+    return new Promise(function (r) { setTimeout(r, 30); }).then(function () { return tex; });
+  }).then(function (tex) {
+    return buildColorZip(d, tex);
+  }).then(function (zip) {
+    colorZip = zip;
+    triggerDownload(zip.url, zip.name);
+  }).catch(function (err) {
+    toast('color export failed: ' + (err && err.message || err));
+  }).then(function () {
+    dl.classList.remove('busy');
+    dl.textContent = restore;
+  });
+}
+
 // ---- preview (three.js) + download ------------------------------------
 var viewerState = null;
 
@@ -651,6 +880,9 @@ function applyViewPrefs() {
     Math.cos(az) * Math.cos(alt), Math.sin(az) * Math.cos(alt), Math.sin(alt));
 }
 function showPreview(d, preserveView) {
+  lastPreview = d;   // kept for the color (X3D + texture) download
+  // the mesh changed, so any previously built color zip is stale
+  if (colorZip) { URL.revokeObjectURL(colorZip.url); colorZip = null; }
   $('preview-title').textContent = d.model.name;
   $('preview-summary').textContent = 'printability: ' + d.summary;
 
@@ -659,6 +891,22 @@ function showPreview(d, preserveView) {
   var dl = $('download');
   dl.href = url;
   dl.download = (d.model.name || 'toporama').replace(/[^a-z0-9]+/gi, '_') + '.stl';
+  dl.textContent = d.model.overlay ? 'Download color (X3D)' : 'Download STL';
+
+  if (d.model.overlay) {
+    // stitch (or reuse) the satellite texture and drape it on the viewer
+    // right away — the preview shows what the color print will look like
+    ensureTexture(d.model).then(function (t) {
+      lastDrape = { canvas: t.canvas, key: bboxKey(d.model) };
+      drapePreview(t.canvas);
+    }).catch(function (err) {
+      toast('satellite imagery failed: ' + (err && err.message || err));
+    });
+    if (d.model.style === 'plain')
+      toast('tip: full-color materials want thicker walls — consider the "Extra sturdy" style');
+  } else {
+    lastDrape = null;   // overlay off: plain material, no drape re-apply
+  }
 
   var meta = $('preview-meta');
   meta.innerHTML = '';
@@ -771,7 +1019,11 @@ function showPreview(d, preserveView) {
   $('preview-panel').style.display = 'flex';
   document.body.classList.add('previewing');   // sidebar -> collapsed drawer
   closeSidebar();                              // start collapsed
-  renderMesh(d.positions, d.indices, preserveView).catch(function (err) {
+  renderMesh(d.positions, d.indices, preserveView).then(function () {
+    // keep the satellite drape across re-meshes of the same box (the
+    // viewer is rebuilt each time, which drops the material's map)
+    if (lastDrape && lastDrape.key === bboxKey(d.model)) drapePreview(lastDrape.canvas);
+  }).catch(function (err) {
     $('preview-meta').insertAdjacentHTML('afterbegin',
       '<div class="msg info" style="display:block">3D preview unavailable (' +
       (err && err.message ? err.message : err) + '). Your STL is ready to ' +
@@ -811,8 +1063,12 @@ async function renderMesh(positionsBuf, indicesBuf, preserveView) {
   var fill = new THREE.DirectionalLight(0xfff2dd, 0.5); fill.position.set(-1, -0.5, 1); scene.add(fill);
 
   var geom = new THREE.BufferGeometry();
-  geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positionsBuf), 3));
+  var positions = new Float32Array(positionsBuf);
+  geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   geom.setIndex(new THREE.BufferAttribute(new Uint32Array(indicesBuf), 1));
+  // UVs use the same planar mapping as the color export, so the stitched
+  // satellite texture can be draped here as an on-screen print preview
+  geom.setAttribute('uv', new THREE.BufferAttribute(Topo.computeUVs(positions), 2));
   geom.computeVertexNormals();
   geom.computeBoundingBox();
   var size = new THREE.Vector3(); geom.boundingBox.getSize(size);
@@ -852,7 +1108,7 @@ async function renderMesh(positionsBuf, indicesBuf, preserveView) {
   viewerState = { renderer: renderer, raf: 0, mesh: mesh,
                   camera: camera, controls: controls,
                   baseMinZ: geom.boundingBox.min.z,
-                  mat: mat, key: key };
+                  mat: mat, key: key, THREE: THREE };
   applyViewPrefs();
   animate();
 }
@@ -942,6 +1198,7 @@ document.addEventListener('DOMContentLoaded', function () {
   // restore a shared model from the URL (after the map exists)
   applySharedParams();
   $('preview-edit').addEventListener('click', openSidebar);
+  $('download').addEventListener('click', onDownloadClick);
   $('preview-close').addEventListener('click', function () {
     // back to the map with the box, handles, and pins exactly as they were
     // (bounds/boxLayer are never cleared by a build), so the user can nudge
