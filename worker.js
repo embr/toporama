@@ -22,6 +22,9 @@ self.onmessage = function (e) {
     var scale = 1000 * (model.upload_scale || 1);
     var stl = Topo.exportSTL(solid, scale);
     var sizeMM = Topo.boundingSizeMM(solid, scale);
+    // material volume in cm³ (mesh is in model meters; honor upload_scale)
+    var volumeCM3 = Math.abs(Topo.meshVolume(solid)) * 1e6 *
+      Math.pow(model.upload_scale || 1, 3);
 
     // positions (mm) + indices for the three.js preview
     var V = solid.numVertices();
@@ -37,6 +40,7 @@ self.onmessage = function (e) {
       num_faces: solid.numFaces(),
       num_vertices: V,
       size_mm: sizeMM,
+      volume_cm3: volumeCM3,
       checks: checks,
       summary: summary,
       info: built.info

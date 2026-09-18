@@ -1038,6 +1038,24 @@
     return buf;
   }
 
+  // Signed volume of a closed mesh (sum of tetrahedra against the origin).
+  // Positive for consistently outward-wound watertight solids; the caller
+  // gets model-meter units (multiply by 1e6 for cm³).
+  function meshVolume(mesh) {
+    var v = mesh.vertices, f = mesh.faces, F = mesh.numFaces();
+    var vol = 0;
+    for (var i = 0; i < F; i++) {
+      var a = f[i * 3] * 3, b = f[i * 3 + 1] * 3, c = f[i * 3 + 2] * 3;
+      var ax = v[a], ay = v[a + 1], az = v[a + 2];
+      var bx = v[b], by = v[b + 1], bz = v[b + 2];
+      var cx = v[c], cy = v[c + 1], cz = v[c + 2];
+      vol += ax * (by * cz - bz * cy) +
+             ay * (bz * cx - bx * cz) +
+             az * (bx * cy - by * cx);
+    }
+    return vol / 6;
+  }
+
   function boundingSizeMM(mesh, scale) {
     if (scale === undefined) scale = 1000;
     var v = mesh.vertices, V = mesh.numVertices();
@@ -1308,6 +1326,7 @@
     exportX3D: exportX3D,
     makeStoredZip: makeStoredZip,
     makeZip: makeZip,
+    meshVolume: meshVolume,
     boundingSizeMM: boundingSizeMM,
     centerAtOrigin: centerAtOrigin
   };

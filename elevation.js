@@ -199,6 +199,11 @@
       if (elevs[i] > 8900) elevs[i] = 8900;
       else if (elevs[i] < -450) elevs[i] = -450;
     }
+    // preallocated neighbour buffer + insertion sort: this loop runs per
+    // grid point, and tiled builds despike the whole assembled grid (a
+    // million+ points), where a per-pixel array + comparator sort used to
+    // stall the page for seconds
+    var nb = new Float64Array(24);
     for (var pass = 0; pass < 2; pass++) {
       var src = Float64Array.from(elevs);
       for (var r = 0; r < m; r++) {
@@ -206,17 +211,21 @@
           // 5x5 neighbourhood median: robust against corrupt blobs a few
           // pixels wide, which slip through a 3x3 (their bad values can
           // dominate a small window, especially at the grid edge)
-          var nb = [];
+          var cnt = 0;
           for (var dr = -2; dr <= 2; dr++) {
             for (var dc = -2; dc <= 2; dc++) {
               if (!dr && !dc) continue;
               var rr2 = r + dr, cc = c + dc;
               if (rr2 < 0 || rr2 >= m || cc < 0 || cc >= n) continue;
-              nb.push(src[rr2 * n + cc]);
+              nb[cnt++] = src[rr2 * n + cc];
             }
           }
-          nb.sort(function (a, b) { return a - b; });
-          var med = nb[nb.length >> 1];
+          for (var s = 1; s < cnt; s++) {
+            var val = nb[s], t2 = s - 1;
+            while (t2 >= 0 && nb[t2] > val) { nb[t2 + 1] = nb[t2]; t2--; }
+            nb[t2 + 1] = val;
+          }
+          var med = nb[cnt >> 1];
           var i2 = r * n + c;
           if (Math.abs(src[i2] - med) > thresh) elevs[i2] = med;
         }

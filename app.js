@@ -613,6 +613,21 @@ function setProgress(frac) { $('building-bar').style.width = Math.round(frac * 1
 // re-mesh with a different distortion/exponent without re-fetching tiles
 var lastBuild = null;
 
+// A solid's triangle count is ~4x its grid cells (top + bottom + sides).
+// Past ~1M triangles a piece is over the print-service cap AND the build
+// eats enough memory to take the tab down, so grids are clamped BEFORE
+// building: returns the largest max_points whose solid stays printable.
+// 950k target keeps the ACTUAL count (estimate + walls/pads) under 1M.
+var SOLID_TRI_CAP = 950000;
+function clampGridPoints(maxPts, estTris, what) {
+  if (estTris <= SOLID_TRI_CAP) return maxPts;
+  var mp2 = Math.max(2, Math.floor(maxPts * Math.sqrt(SOLID_TRI_CAP / estTris)));
+  toast('grid points clamped to ' + mp2 + ' — ' + what +
+    ' is at the ~1M-triangle printable cap; for more total detail use smaller tiles');
+  log('grid clamp:', maxPts, '->', mp2, '(', estTris, 'estimated triangles )');
+  return mp2;
+}
+
 // one tile (or the whole untiled model) through the mesh worker
 function runWorkerBuild(model, worldBuf, m, n) {
   return new Promise(function (resolve, reject) {
@@ -729,6 +744,11 @@ function doBuild() {
   if (model.tiled) { doBuildTiled(model, useGoogle, fetchOpts); return; }
 
   var grid = Topo.buildLngLatGrid(model.north, model.south, model.west, model.east, model.max_points);
+  var mpClamped = clampGridPoints(model.max_points, 4 * grid.m * grid.n, 'the model');
+  if (mpClamped !== model.max_points) {
+    model.max_points = mpClamped;
+    grid = Topo.buildLngLatGrid(model.north, model.south, model.west, model.east, mpClamped);
+  }
   var unit = useGoogle ? 'rows' : 'tiles';
 
   getElevations(model, grid, useGoogle, fetchOpts,
@@ -800,6 +820,12 @@ function doBuildTiled(model, useGoogle, fetchOpts) {
     layout = TopoTiling.computeLayout(box, model.output_x_meters,
       ts.maxWM, ts.maxDM, ts.forceRows, ts.forceCols);
     spec = TopoTiling.buildGridSpec(box, layout.rows, layout.cols, model.max_points);
+    var mpClamped = clampGridPoints(model.max_points,
+      4 * spec.mTile * spec.nTile, 'each tile');
+    if (mpClamped !== model.max_points) {
+      model.max_points = mpClamped;
+      spec = TopoTiling.buildGridSpec(box, layout.rows, layout.cols, mpClamped);
+    }
   } catch (e) { setBuilding(false); showError(e.message); return; }
   if (!layout.fits)
     toast('warning: tiles are larger than the max tile size — check the row/column overrides');
@@ -1381,6 +1407,7 @@ function showPreview(d, preserveView) {
   function add(k, v) { var dt = document.createElement('dt'); dt.textContent = k; var dd = document.createElement('dd'); dd.textContent = v; dl2.appendChild(dt); dl2.appendChild(dd); }
   add('triangles', d.num_faces.toLocaleString());
   add('size (mm)', d.size_mm.map(function (x) { return x.toFixed(1); }).join(' × '));
+  if (d.volume_cm3) add('material volume', fmtVolume(d.volume_cm3));
   add('grid', d.model.max_points + ' pts → ' + d.num_vertices.toLocaleString() + ' vertices');
   add('grid spacing (m)', d.grid_spacing_m.toFixed(1));
   if (d.resolution) add('data resolution (m)', '~' + d.resolution.median +
@@ -1495,6 +1522,11 @@ function addTuneSliders(meta, d) {
   });
 }
 
+function fmtVolume(cm3) {
+  return (cm3 >= 100 ? Math.round(cm3).toLocaleString()
+                     : cm3.toFixed(cm3 >= 10 ? 1 : 2)) + ' cm³';
+}
+
 // checkerboard tints so adjacent tiles read as distinct pieces; with the
 // satellite drape the material color multiplies the texture, so use white
 // vs. a slight dim instead of the tan pair
@@ -1547,7 +1579,8 @@ function showPreviewTiled(ds, layout, preserveView) {
     nm.textContent = 'tile ' + d.tile.label;
     var ms = document.createElement('span');
     ms.textContent = d.size_mm.map(function (x) { return x.toFixed(0); }).join(' × ') +
-      ' mm · ' + d.num_faces.toLocaleString() + ' tris · ';
+      ' mm · ' + d.num_faces.toLocaleString() + ' tris' +
+      (d.volume_cm3 ? ' · ' + fmtVolume(d.volume_cm3) : '') + ' · ';
     var a = document.createElement('a');
     a.href = url; a.download = base + '_' + d.tile.label + '.stl';
     a.textContent = 'STL';
@@ -1581,6 +1614,9 @@ function showPreviewTiled(ds, layout, preserveView) {
   add('tile size (cm)', '≤ ' + (layout.tileWidthM * 100).toFixed(1) +
     ' × ' + (layout.tileDepthM * 100).toFixed(1));
   add('triangles (total)', ds.reduce(function (s, d) { return s + d.num_faces; }, 0).toLocaleString());
+  var totalVol = ds.reduce(function (s, d) { return s + (d.volume_cm3 || 0); }, 0);
+  if (totalVol) add('material volume (total)', fmtVolume(totalVol) +
+    ' — most print services price mainly on this');
   add('grid spacing (m)', d0.grid_spacing_m.toFixed(1));
   if (d0.resolution) add('data resolution (m)', '~' + d0.resolution.median +
     (d0.zoom ? ' (zoom ' + d0.zoom + ')' : ' (Google)'));
