@@ -215,17 +215,45 @@
     #building-overlay .label { font-size: 14px; color: var(--ink); }
     .leaflet-container { background: #e9e4d8; }
     .leaflet-control-attribution { font-size: 10px; }
-    /* box corner-resize handles */
+    /* shape kind selector, above the PLACE button */
+    .shape-seg {
+      display: flex; border: 1px solid var(--accent); border-radius: 8px;
+      overflow: hidden; margin-bottom: 10px;
+    }
+    .shape-seg button {
+      flex: 1; border: none; background: #fff; color: var(--accent);
+      font-size: 12px; font-weight: 600; padding: 7px 0; cursor: pointer;
+      border-right: 1px solid var(--accent);
+    }
+    .shape-seg button:last-child { border-right: none; }
+    .shape-seg button.on { background: var(--accent); color: #fff; }
+    /* corner-resize handles (rectangle corners, circle radius, polygon
+       vertices) */
     .corner-handle {
       background: #fff; border: 2.5px solid var(--accent); border-radius: 4px;
       box-shadow: 0 1px 3px rgba(0,0,0,0.35); cursor: grab;
     }
-    /* center move-the-box handle */
+    .corner-handle.vertex { border-radius: 50%; }
+    /* center move-the-shape handle */
     .move-handle {
       background: var(--accent); color: #fff; border: 2px solid #fff;
       border-radius: 50%; box-shadow: 0 1px 4px rgba(0,0,0,0.4);
       display: flex; align-items: center; justify-content: center;
       font-size: 15px; line-height: 1; cursor: grab;
+    }
+    /* rotate-the-rectangle handle, floating past its north edge */
+    .rotate-handle {
+      background: #fff; color: var(--accent); border: 2.5px solid var(--accent);
+      border-radius: 50%; box-shadow: 0 1px 4px rgba(0,0,0,0.35);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 15px; font-weight: 700; line-height: 1; cursor: grab;
+    }
+    /* midpoint "+" that inserts a new polygon corner */
+    .mid-handle {
+      background: rgba(255,255,255,0.9); color: var(--accent);
+      border: 1.5px dashed var(--accent); border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 12px; font-weight: 700; line-height: 1; cursor: copy;
     }
     /* pin-hole markers */
     .pin-marker {
@@ -273,7 +301,12 @@
       <button id="sidebar-close" type="button" aria-label="Close menu">&times;</button>
     </div>
 
-    <button id="draw-btn" class="secondary" type="button">PLACE BOX</button>
+    <div class="seg shape-seg" id="shape-seg">
+      <button type="button" data-shape="rect" class="on">▭ Rectangle</button>
+      <button type="button" data-shape="circle">◯ Circle</button>
+      <button type="button" data-shape="poly">⬠ Polygon</button>
+    </div>
+    <button id="draw-btn" class="secondary" type="button">PLACE RECTANGLE</button>
     <button id="pin-btn" class="secondary" type="button" disabled>ADD PIN HOLES</button>
     <div id="pin-status" class="hint" style="margin:-8px 0 12px"></div>
     <div id="err" class="msg error"></div>
@@ -497,10 +530,11 @@
         "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
     } }
   </script>
-  <script src="topocore.js?v=37"></script>
-  <script src="tiling.js?v=37"></script>
-  <script src="elevation.js?v=37"></script>
-  <script src="elevation-google.js?v=37"></script>
-  <script type="module" src="app.js?v=37"></script>
+  <script src="topocore.js?v=40"></script>
+  <script src="shapes.js?v=40"></script>
+  <script src="tiling.js?v=40"></script>
+  <script src="elevation.js?v=40"></script>
+  <script src="elevation-google.js?v=40"></script>
+  <script type="module" src="app.js?v=40"></script>
 </body>
 </html>

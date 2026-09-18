@@ -20,6 +20,7 @@ import { fileURLToPath } from 'url';
 const require = createRequire(import.meta.url);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const Topo = require(path.join(__dirname, '..', 'topocore.js'));
+const Shape = require(path.join(__dirname, '..', 'shapes.js'));
 const Tiling = require(path.join(__dirname, '..', 'tiling.js'));
 
 let failures = 0;
@@ -29,10 +30,14 @@ function check(label, ok, detail) {
 }
 
 const BOX = { north: 46.95, south: 46.75, east: -121.60, west: -121.90 };
+// tiling works in a shape's local frame; an unrotated rectangle's frame is
+// the old axis-aligned box, so these tests still describe the same geometry
+const SHAPE = Shape.fromBounds(BOX);
+const FR = Shape.frame(SHAPE);
 
 // ---------- part 1: layout ----------
 {
-  const lay = Tiling.computeLayout(BOX, 0.60, 0.25, 0.25);
+  const lay = Tiling.computeLayout(FR, 0.60, 0.25, 0.25);
   check('layout: cols = ceil(width/max)', lay.cols === 3, 'cols=' + lay.cols);
   check('layout: rows sized from depth', lay.rows === Math.ceil(lay.totalDepthM / 0.25), 'rows=' + lay.rows);
   check('layout: tile width within max', lay.tileWidthM <= 0.25 + 1e-12);
@@ -40,23 +45,25 @@ const BOX = { north: 46.95, south: 46.75, east: -121.60, west: -121.90 };
   check('layout: fits', lay.fits === true);
   check('layout: tiles cover the width exactly', Math.abs(lay.tileWidthM * lay.cols - 0.60) < 1e-12);
 
-  const one = Tiling.computeLayout(BOX, 0.10, 0.25, 0.25);
+  const one = Tiling.computeLayout(FR, 0.10, 0.25, 0.25);
   check('layout: small model is a single tile', one.rows === 1 && one.cols === 1);
 
-  const forced = Tiling.computeLayout(BOX, 0.60, 0.25, 0.25, 1, 1);
+  const forced = Tiling.computeLayout(FR, 0.60, 0.25, 0.25, 1, 1);
   check('layout: forced 1x1 reports fits=false', forced.fits === false);
 
-  const seams = Tiling.seamLines(BOX, lay.rows, lay.cols);
-  check('seams: counts', seams.lngs.length === lay.cols - 1 && seams.lats.length === lay.rows - 1);
-  check('seams: inside the box',
-    seams.lngs.every(l => l > BOX.west && l < BOX.east) &&
-    seams.lats.every(l => l > BOX.south && l < BOX.north));
+  const seams = Tiling.seamLines(FR, FR, lay.rows, lay.cols);
+  check('seams: one segment per interior cut',
+    seams.length === (lay.cols - 1) + (lay.rows - 1), 'n=' + seams.length);
+  check('seams: every endpoint inside the box', seams.every(seg =>
+    seg.every(([lat, lng]) =>
+      lat >= BOX.south - 1e-9 && lat <= BOX.north + 1e-9 &&
+      lng >= BOX.west - 1e-9 && lng <= BOX.east + 1e-9)));
 }
 
 // ---------- part 1: grid spec & slices ----------
 {
   const rows = 2, cols = 3, maxPts = 40;
-  const spec = Tiling.buildGridSpec(BOX, rows, cols, maxPts);
+  const spec = Tiling.buildGridSpec(FR, FR, rows, cols, maxPts);
   check('grid: global sizes', spec.NX === cols * (spec.nTile - 1) + 1 &&
                               spec.NY === rows * (spec.mTile - 1) + 1);
   check('grid: longer tile side gets maxPts', Math.max(spec.mTile, spec.nTile) === maxPts);
@@ -79,7 +86,9 @@ const BOX = { north: 46.95, south: 46.75, east: -121.60, west: -121.90 };
   check('grid: shared row bit-identical', rowsMatch);
   check('grid: tile bounds continuous', a.bounds.east === b.bounds.west &&
                                         a.bounds.south === d.bounds.north);
-  check('grid: outer bounds exact', a.bounds.west === BOX.west && a.bounds.north === BOX.north);
+  check('grid: outer bounds exact',
+    Math.abs(a.bounds.west - BOX.west) < 1e-9 &&
+    Math.abs(a.bounds.north - BOX.north) < 1e-9);
 
   // elevation slice round trip
   const glob = new Float64Array(spec.NY * spec.NX);
@@ -98,7 +107,7 @@ const BOX = { north: 46.95, south: 46.75, east: -121.60, west: -121.90 };
 // ---------- part 1: shared z params ----------
 {
   const xRange = 100000;   // 100 km of mercator width, 0.6 m model
-  const base = { totalWidthM: 0.6, xRangeMerc: xRange, zMin: 200, zMax: 2200,
+  const base = { totalWidthM: 0.6, uRange: xRange, zMin: 200, zMax: 2200,
                  topThickness: 0.0007 };
   const p1 = Tiling.sharedZParams(Object.assign({}, base));
   check('zparams: default distortion 2', p1.distortion === 2);
@@ -129,7 +138,7 @@ const BOX = { north: 46.95, south: 46.75, east: -121.60, west: -121.90 };
 {
   const rows = 2, cols = 2, maxPts = 24;
   const totalWidthM = 0.4;
-  const spec = Tiling.buildGridSpec(BOX, rows, cols, maxPts);
+  const spec = Tiling.buildGridSpec(FR, FR, rows, cols, maxPts);
 
   // smooth synthetic terrain, a pure function of (lng, lat)
   const terrain = (lng, lat) =>
@@ -138,15 +147,17 @@ const BOX = { north: 46.95, south: 46.75, east: -121.60, west: -121.90 };
   // global elevations + extremes (what the orchestrator computes)
   const glob = new Float64Array(spec.NY * spec.NX);
   for (let j = 0; j < spec.NY; j++)
-    for (let k = 0; k < spec.NX; k++)
-      glob[j * spec.NX + k] = terrain(spec.lngs[k], spec.lats[j]);
+    for (let k = 0; k < spec.NX; k++) {
+      const ll = Shape.localToLngLat(FR, spec.us[k], spec.vs[j]);
+      glob[j * spec.NX + k] = terrain(ll[0], ll[1]);
+    }
   let zMin = Infinity, zMax = -Infinity;
   for (const v of glob) { if (v < zMin) zMin = v; if (v > zMax) zMax = v; }
 
   // exercise the hard mode: thickness + peak-flattening exponent
   const topThickness = 0.0007;
   const shared = Tiling.sharedZParams({
-    totalWidthM, xRangeMerc: spec.xRangeMerc, zMin, zMax,
+    totalWidthM, uRange: spec.uRange, zMin, zMax,
     topThickness, outputZMeters: 0.03, exponent: 0.7
   });
 
@@ -167,12 +178,11 @@ const BOX = { north: 46.95, south: 46.75, east: -121.60, west: -121.90 };
         top_thickness: topThickness, top_pad_width: 0, wall_thickness: 0.001,
         tiled: true
       };
-      const xy = Topo.projectPtsXY(t.pts);
       const elevs = Tiling.sliceElevations(spec, glob, r, c);
       const world = new Float64Array(t.m * t.n * 3);
       for (let p = 0; p < t.m * t.n; p++) {
-        world[p * 3] = xy[p * 2];
-        world[p * 3 + 1] = xy[p * 2 + 1];
+        world[p * 3] = t.uv[p * 2];
+        world[p * 3 + 1] = t.uv[p * 2 + 1];
         world[p * 3 + 2] = elevs[p];
       }
       const built = Topo.buildSolid(model, world, t.m, t.n);

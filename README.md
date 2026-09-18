@@ -53,6 +53,33 @@ nothing to restrict or protect; anyone can use the deployed URL directly.
 - **Box editing.** After drawing, "redraw" replaces the box (there are no drag
   handles to resize it in place yet). The lat/long entry covers precise boxes.
 
+## Selection shapes
+
+The selector above the place button picks what you're cutting out:
+
+- **Rectangle** — drag a corner to resize, **↻** to rotate (it snaps to 15°),
+  **✥** to move. Rotation turns the *sampling*, not the model: the print
+  still comes out an upright rectangle, so you can line a model up with a
+  valley or a coastline instead of with north.
+- **Circle** — drag the edge handle to resize. The rim is a true circle, not
+  a staircase of grid cells.
+- **Polygon** — tap corners on the map, then **FINISH POLYGON**. Afterwards
+  drag a corner to move it, tap one to delete it, or tap a **+** between two
+  corners to insert one. Concave outlines are fine.
+
+Everything downstream works for all three, tiling included (a tile that
+falls entirely outside the shape is skipped). Two current limits: pin holes
+need a rectangle, and a polygon is cut from its own bounding box, so its
+printed width is that box's width.
+
+How it works: each shape carries a local frame (a centre plus a rotation),
+and the sample grid is built axis-aligned *in that frame* — which is why a
+rotated rectangle needs no mesh changes at all. Circles and polygons are
+that same grid with outside cells dropped and the surviving outside corners
+pulled onto the true boundary; the snap is fold-guarded, so the mesh stays
+watertight, and walls are extruded along oriented boundary edges so
+concave notches don't invert. See `shapes.js`.
+
 ## Tiling (models bigger than one print)
 
 Check **Tile into multiple prints**, enter the largest piece your printer or
@@ -76,6 +103,7 @@ earlier build.
 ```bash
 node test/smoke.mjs
 node test/tiling.mjs
+node test/shapes.mjs
 ```
 
 Stubs Leaflet + three.js and injects a synthetic terrarium tile, then drives

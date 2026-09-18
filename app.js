@@ -19,12 +19,17 @@ window.addEventListener('unhandledrejection', function (e) {
   log('unhandled promise rejection:', e.reason && e.reason.message || e.reason);
 });
 
-// bounds is a plain {north, south, east, west} object (no map-lib types).
+// `shape` (a TopoShape) is the selection; `bounds` is its derived
+// {north, south, east, west} geographic box (no map-lib types), which the
+// elevation, imagery and map-fitting paths all still work in.
 var map, boxLayer = null, bounds = null;
-var cornerHandles = [];        // 4 draggable L.markers on the box corners
-var moveHandle = null;         // center L.marker that drags the whole box
+var shape = null;              // TopoShape: rect (rotatable) | circle | poly
+var shapeKind = 'rect';        // which kind the PLACE button creates
+var handles = [];              // all draggable L.markers on the shape
+var cornerHandles = [];        // subset: the rectangle's 4 corners
+var moveHandle = null;         // center L.marker that drags the whole shape
 var pins = [];                 // L.markers for pin-hole locations
-var activeTool = null;         // null | 'pin'
+var activeTool = null;         // null | 'pin' | 'poly'
 
 // ---- small helpers ----------------------------------------------------
 function $(id) { return document.getElementById(id); }
@@ -124,21 +129,35 @@ function closeSidebar() {
   if (map) setTimeout(function () { map.invalidateSize(); }, 260);
 }
 
-function setBox(n, s, e, w) {
-  var latlngs = [[s, w], [n, e]];
-  if (boxLayer) { boxLayer.setBounds(latlngs); }
-  else { boxLayer = L.rectangle(latlngs, RECT_STYLE).addTo(map); }
+// ---- the selection shape -----------------------------------------------
+// The selection is a TopoShape: a rectangle (rotatable), a circle, or an
+// arbitrary polygon. `shape` is the source of truth; `bounds` is kept as
+// its derived geographic bounding box, because elevation tiles, satellite
+// imagery and map fitting all still work in plain north-up degrees.
+function setShape(s) {
+  shape = s;
+  bounds = s ? TopoShape.geoBounds(s) : null;
+  drawShape();
+}
+function drawShape() {
+  if (!shape) {
+    if (boxLayer) { map.removeLayer(boxLayer); boxLayer = null; }
+    return;
+  }
+  var ring = TopoShape.outlineLatLng(shape);
+  if (boxLayer) boxLayer.setLatLngs(ring);
+  else boxLayer = L.polygon(ring, RECT_STYLE).addTo(map);
 }
 function clearBox() {
   if (boxLayer) { map.removeLayer(boxLayer); boxLayer = null; }
-  removeCornerHandles();
+  shape = null; bounds = null;
+  removeHandles();
 }
 
-// ---- draggable corner handles to resize the box -------------------------
-// Four small square markers, one per corner. Dragging one moves that
-// corner while the opposite corner stays put (the usual rectangle-resize
-// affordance). Handles are plain draggable markers, so this works with
-// both mouse and touch for free.
+// ---- draggable handles --------------------------------------------------
+// One idiom for all three shapes: small square handles reshape, the ✥
+// handle moves the whole selection, and (for a rectangle) ↻ rotates it.
+// Handles are plain draggable markers, so mouse and touch both work.
 var HANDLE_ICON = L.divIcon({
   className: 'corner-handle', iconSize: [18, 18], iconAnchor: [9, 9]
 });
@@ -146,118 +165,283 @@ var MOVE_ICON = L.divIcon({
   className: 'move-handle', iconSize: [26, 26], iconAnchor: [13, 13],
   html: '&#x2725;'   // ✥ four-directions arrow
 });
-// corner order: 0=NW 1=NE 2=SE 3=SW
-function cornerLatLng(i) {
-  return [
-    [bounds.north, bounds.west], [bounds.north, bounds.east],
-    [bounds.south, bounds.east], [bounds.south, bounds.west]
-  ][i];
-}
-function removeCornerHandles() {
-  cornerHandles.forEach(function (h) { map.removeLayer(h); });
+var ROTATE_ICON = L.divIcon({
+  className: 'rotate-handle', iconSize: [24, 24], iconAnchor: [12, 12],
+  html: '&#x21bb;'   // ↻
+});
+var VERTEX_ICON = L.divIcon({
+  className: 'corner-handle vertex', iconSize: [16, 16], iconAnchor: [8, 8]
+});
+var MID_ICON = L.divIcon({
+  className: 'mid-handle', iconSize: [15, 15], iconAnchor: [7, 7], html: '+'
+});
+
+// Where the rotation handle floats beyond the rectangle's north edge.
+var ROTATE_STANDOFF = 1.14;
+
+function removeHandles() {
+  handles.forEach(function (h) { map.removeLayer(h); });
+  handles = [];
+  moveHandle = null;
   cornerHandles = [];
-  if (moveHandle) { map.removeLayer(moveHandle); moveHandle = null; }
 }
-function boxCenter() {
-  return [(bounds.north + bounds.south) / 2, (bounds.east + bounds.west) / 2];
-}
-function updateCornerHandles() {
-  if (!bounds || !cornerHandles.length) return;
-  for (var i = 0; i < 4; i++) cornerHandles[i].setLatLng(cornerLatLng(i));
-  if (moveHandle) moveHandle.setLatLng(boxCenter());
-}
-function addCornerHandles() {
-  removeCornerHandles();
-  if (!bounds) return;
-  for (var i = 0; i < 4; i++) {
-    (function (idx) {
-      var h = L.marker(cornerLatLng(idx), {
-        icon: HANDLE_ICON, draggable: true, keyboard: false, zIndexOffset: 1000
-      }).addTo(map);
-      h.on('drag', function (ev) {
-        var p = ev.target.getLatLng();
-        // the opposite corner (idx+2 mod 4) is the anchor
-        var a = cornerLatLng((idx + 2) % 4);
-        bounds = {
-          north: Math.max(p.lat, a[0]), south: Math.min(p.lat, a[0]),
-          east: Math.max(p.lng, a[1]), west: Math.min(p.lng, a[1])
-        };
-        setBox(bounds.north, bounds.south, bounds.east, bounds.west);
-        // move the two adjacent handles live (not the one being dragged)
-        for (var k = 0; k < 4; k++)
-          if (k !== idx) cornerHandles[k].setLatLng(cornerLatLng(k));
-      });
-      h.on('dragend', function () {
-        updateCornerHandles();           // snap the dragged one to the corner
-        updateHeight(); maybeEnableBuild();
-        log('box resized via corner drag:', bounds);
-      });
-      cornerHandles.push(h);
-    })(i);
+
+// The map position a handle should sit at, derived from the shape — so a
+// single function keeps every handle in sync after any edit.
+function handleLatLng(role, i) {
+  var fr = TopoShape.frame(shape);
+  var l;
+  if (role === 'center') l = [0, 0];
+  else if (role === 'rotate') l = [0, shape.halfV * ROTATE_STANDOFF];
+  else if (role === 'radius') l = [shape.radius, 0];
+  else if (role === 'corner') {
+    var sg = CORNER_SIGNS[i];
+    l = [sg[0] * shape.halfU, sg[1] * shape.halfV];
+  } else if (role === 'vertex') {
+    var ll0 = Topo.unproject(shape.ring[i][0], shape.ring[i][1]);
+    return [ll0[1], ll0[0]];
+  } else if (role === 'mid') {
+    var a = shape.ring[i], b = shape.ring[(i + 1) % shape.ring.length];
+    var ll1 = Topo.unproject((a[0] + b[0]) / 2, (a[1] + b[1]) / 2);
+    return [ll1[1], ll1[0]];
   }
-  // center handle: drag to move the whole box without resizing it
-  moveHandle = L.marker(boxCenter(), {
-    icon: MOVE_ICON, draggable: true, keyboard: false, zIndexOffset: 1100
-  }).addTo(map);
-  // anchor the whole drag to its starting state and apply an ABSOLUTE
-  // delta each event — accumulating incremental deltas drifts if any
-  // single event is dropped or re-ordered mid-drag
-  var dragStart = null;
-  moveHandle.on('dragstart', function (ev) {
-    dragStart = { bounds: bounds, at: ev.target.getLatLng() };
-  });
-  moveHandle.on('drag', function (ev) {
-    if (!dragStart) return;
-    var p = ev.target.getLatLng();
-    var dLat = p.lat - dragStart.at.lat, dLng = p.lng - dragStart.at.lng;
-    bounds = {
-      north: dragStart.bounds.north + dLat, south: dragStart.bounds.south + dLat,
-      east: dragStart.bounds.east + dLng, west: dragStart.bounds.west + dLng
-    };
-    setBox(bounds.north, bounds.south, bounds.east, bounds.west);
-    for (var k = 0; k < 4; k++) cornerHandles[k].setLatLng(cornerLatLng(k));
-  });
-  moveHandle.on('dragend', function () {
-    dragStart = null;
-    updateCornerHandles();
-    updateHeight(); maybeEnableBuild();
-    log('box moved via center drag:', bounds);
+  var ll = TopoShape.localToLngLat(fr, l[0], l[1]);
+  return [ll[1], ll[0]];
+}
+var CORNER_SIGNS = [[-1, 1], [1, 1], [1, -1], [-1, -1]];   // NW NE SE SW
+
+function positionHandles(skip) {
+  if (!shape) return;
+  handles.forEach(function (h) {
+    if (h === skip) return;
+    h.setLatLng(handleLatLng(h._role, h._idx));
   });
 }
 
-// ---- box placement ------------------------------------------------------
+function mkHandle(role, idx, icon, zOff, onDrag, onClick) {
+  var h = L.marker(handleLatLng(role, idx), {
+    icon: icon, draggable: !!onDrag, keyboard: false, zIndexOffset: zOff
+  }).addTo(map);
+  h._role = role; h._idx = idx;
+  if (onDrag) {
+    h.on('drag', function (ev) {
+      onDrag(ev.target.getLatLng());
+      bounds = TopoShape.geoBounds(shape);
+      drawShape();
+      positionHandles(h);        // never fight the handle being dragged
+    });
+    h.on('dragend', function () {
+      positionHandles();         // snap the dragged one onto the shape
+      onShapeEdited();
+    });
+  }
+  if (onClick) h.on('click', onClick);
+  handles.push(h);
+  return h;
+}
+
+function onShapeEdited() {
+  updateHeight(); maybeEnableBuild(); updateTileOverlay();
+  log('shape edited:', shape.kind, bounds);
+}
+
+function buildHandles() {
+  removeHandles();
+  if (!shape) return;
+
+  if (shape.kind === 'rect') {
+    // Corners resize along the RECTANGLE's own axes (not north/east), so a
+    // rotated rectangle stays a rectangle and the opposite corner stays put.
+    CORNER_SIGNS.forEach(function (sg, i) {
+      cornerHandles.push(mkHandle('corner', i, HANDLE_ICON, 1000, function (ll) {
+        var fr = TopoShape.frame(shape);
+        var l = TopoShape.lngLatToLocal(fr, ll.lng, ll.lat);
+        var ou = -sg[0] * shape.halfU, ov = -sg[1] * shape.halfV;
+        var mid = TopoShape.toMerc(fr, (l[0] + ou) / 2, (l[1] + ov) / 2);
+        shape.cx = mid[0]; shape.cy = mid[1];
+        shape.halfU = Math.max(Math.abs(l[0] - ou) / 2, 1);
+        shape.halfV = Math.max(Math.abs(l[1] - ov) / 2, 1);
+      }));
+    });
+    mkHandle('rotate', 0, ROTATE_ICON, 1200, function (ll) {
+      var p = Topo.project(ll.lng, ll.lat);
+      // the handle rides the +v axis, which points at (rotation + 90°)
+      var ang = Math.atan2(p[1] - shape.cy, p[0] - shape.cx) * 180 / Math.PI - 90;
+      var snapped = Math.round(ang / 15) * 15;    // light snap to 15°
+      if (Math.abs(ang - snapped) < 2.5) ang = snapped;
+      shape.rotation = ((ang % 360) + 360) % 360;
+      toast('rotation ' + shape.rotation.toFixed(0) + '°', 1200);
+    });
+  } else if (shape.kind === 'circle') {
+    mkHandle('radius', 0, HANDLE_ICON, 1000, function (ll) {
+      var p = Topo.project(ll.lng, ll.lat);
+      shape.radius = Math.max(1,
+        Math.sqrt(Math.pow(p[0] - shape.cx, 2) + Math.pow(p[1] - shape.cy, 2)));
+    });
+  } else {
+    // polygon: drag a corner to move it, tap it to delete; the small +
+    // between two corners inserts a new one there
+    shape.ring.forEach(function (pt, i) {
+      mkHandle('vertex', i, VERTEX_ICON, 1000, function (ll) {
+        var p = Topo.project(ll.lng, ll.lat);
+        shape.ring[i] = [p[0], p[1]];
+        TopoShape.recenterPoly(shape);
+      }, function () {
+        if (shape.ring.length <= 3) { toast('a polygon needs at least 3 corners'); return; }
+        shape.ring.splice(i, 1);
+        TopoShape.recenterPoly(shape);
+        setShape(shape); buildHandles(); onShapeEdited();
+      });
+    });
+    shape.ring.forEach(function (pt, i) {
+      mkHandle('mid', i, MID_ICON, 900, null, function () {
+        var a = shape.ring[i], b = shape.ring[(i + 1) % shape.ring.length];
+        shape.ring.splice(i + 1, 0, [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]);
+        TopoShape.recenterPoly(shape);
+        setShape(shape); buildHandles(); onShapeEdited();
+      });
+    });
+  }
+
+  // every shape moves by its centre handle
+  moveHandle = mkHandle('center', 0, MOVE_ICON, 1100, function (ll) {
+    var p = Topo.project(ll.lng, ll.lat);
+    var dx = p[0] - shape.cx, dy = p[1] - shape.cy;
+    if (shape.ring)
+      shape.ring = shape.ring.map(function (q) { return [q[0] + dx, q[1] + dy]; });
+    shape.cx = p[0]; shape.cy = p[1];
+  });
+}
+
+// ---- placing a shape ----------------------------------------------------
 // Pan and zoom are ALWAYS the default map gestures — there is no modal
-// "drawing" state to fight with them (an earlier drag-to-draw mode was
-// unusable on phones: you couldn't reposition the map without first
-// leaving the mode). Instead, PLACE BOX drops a box in the middle of the
-// current view at 50% of the viewport size, and the user adjusts it with
-// the corner handles (resize) and the center handle (move). Pressing the
-// button again re-centers the existing box in the current view.
-function placeBox() {
+// "drawing" state to fight with them for rectangles and circles: the
+// button drops a shape in the middle of the current view at 50% of the
+// viewport, and the handles adjust it. Polygons are the exception; they
+// genuinely need per-corner taps, so they get an explicit draw mode.
+var SHAPE_LABELS = {
+  rect: ['PLACE RECTANGLE', 'RECENTER RECTANGLE'],
+  circle: ['PLACE CIRCLE', 'RECENTER CIRCLE'],
+  poly: ['DRAW POLYGON', 'REDRAW POLYGON']
+};
+function placeShape() {
   if (!map) return;
   setPinMode(false);
+  if (shapeKind === 'poly') { startPolyDraw(); return; }
   var vb = map.getBounds();
   var cLat = (vb.getNorth() + vb.getSouth()) / 2;
   var cLng = (vb.getEast() + vb.getWest()) / 2;
-  var halfH = (vb.getNorth() - vb.getSouth()) * 0.25;   // half of 50% view
-  var halfW = (vb.getEast() - vb.getWest()) * 0.25;
-  finishBox(cLat + halfH, cLat - halfH, cLng + halfW, cLng - halfW);
+  var p0 = Topo.project(vb.getWest(), vb.getSouth());
+  var p1 = Topo.project(vb.getEast(), vb.getNorth());
+  var halfU = (p1[0] - p0[0]) * 0.25, halfV = (p1[1] - p0[1]) * 0.25;
+  // re-centering keeps the rotation you already dialled in
+  var rot = (shape && shape.kind === 'rect') ? shape.rotation : 0;
+  finishShape(shapeKind === 'circle'
+    ? TopoShape.circle([cLng, cLat], Math.min(halfU, halfV))
+    : TopoShape.rect([cLng, cLat], halfU, halfV, rot));
 }
 
-function finishBox(n, s, e, w) {
-  bounds = { north: n, south: s, east: e, west: w };
-  setBox(n, s, e, w);
-  addCornerHandles();
-  $('draw-btn').textContent = 'RECENTER BOX';
-  $('pin-btn').disabled = false;
-  updateHeight(); maybeEnableBuild();
-  log('box finished:', bounds);
+function finishShape(s) {
+  setShape(s);
+  buildHandles();
+  $('draw-btn').disabled = false;
+  $('draw-btn').textContent = SHAPE_LABELS[s.kind][1];
+  // pin holes locate their cells on the rectangular grid, so they are not
+  // available on a masked shape yet
+  var masked = TopoShape.needsMask(s);
+  $('pin-btn').disabled = masked;
+  $('pin-status').textContent = masked && pins.length
+    ? pins.length + ' pin hole(s) will be skipped — pins need a rectangle'
+    : $('pin-status').textContent;
+  updateHeight(); maybeEnableBuild(); updateTileOverlay();
+  log('shape placed:', s.kind, bounds);
   if (sidebarIsDrawer())
     // drawer is collapsed on mobile — adjust freely, then use the toast
-    // button to bring the settings back when the box looks right
-    actionToast('Drag corners or ✥ to adjust', 'DONE ✓', openSidebar);
+    // button to bring the settings back when the shape looks right
+    actionToast(s.kind === 'circle' ? 'Drag the edge or ✥ to adjust'
+      : 'Drag a handle or ✥ to adjust', 'DONE ✓', openSidebar);
+  else if (s.kind === 'rect')
+    toast('drag a corner to resize, ↻ to rotate, ✥ to move');
+  else if (s.kind === 'circle')
+    toast('drag the edge handle to resize, ✥ to move');
   else
-    toast('drag a corner to resize, ✥ to move');
+    toast('drag a corner to move it, tap one to delete, + to add');
+}
+
+// ---- polygon draw mode --------------------------------------------------
+var polyDraft = null;    // { pts: [[lng,lat], ...], line, dots: [] }
+
+function startPolyDraw() {
+  clearBox();
+  polyDraft = { pts: [], line: null, dots: [] };
+  activeTool = 'poly';
+  $('draw-btn').textContent = 'FINISH POLYGON';
+  $('draw-btn').disabled = true;         // needs 3 corners first
+  map.getContainer().style.cursor = 'crosshair';
+  maybeEnableBuild();
+  if (sidebarIsDrawer()) closeSidebar();
+  toast('tap the map to add corners, then press FINISH POLYGON', 6000);
+}
+function onMapClickForPoly(latlng) {
+  polyDraft.pts.push([latlng.lng, latlng.lat]);
+  var lls = polyDraft.pts.map(function (p) { return [p[1], p[0]]; });
+  if (polyDraft.line) polyDraft.line.setLatLngs(lls);
+  else polyDraft.line = L.polyline(lls,
+    { color: '#b05c2a', weight: 3, dashArray: '5 5', interactive: false }).addTo(map);
+  polyDraft.dots.push(L.marker([latlng.lat, latlng.lng],
+    { icon: VERTEX_ICON, keyboard: false, interactive: false }).addTo(map));
+  if (polyDraft.pts.length >= 3) {
+    $('draw-btn').disabled = false;
+    if (polyDraft.pts.length === 3) toast('press FINISH POLYGON when done', 4000);
+  }
+}
+function finishPolyDraw() {
+  if (!polyDraft || polyDraft.pts.length < 3) { toast('a polygon needs at least 3 corners'); return; }
+  if (polyDraft.line) map.removeLayer(polyDraft.line);
+  polyDraft.dots.forEach(function (d) { map.removeLayer(d); });
+  var pts = polyDraft.pts;
+  polyDraft = null;
+  activeTool = null;
+  map.getContainer().style.cursor = '';
+  finishShape(TopoShape.poly(pts));
+}
+function cancelPolyDraw() {
+  if (!polyDraft) return;
+  if (polyDraft.line) map.removeLayer(polyDraft.line);
+  polyDraft.dots.forEach(function (d) { map.removeLayer(d); });
+  polyDraft = null;
+  activeTool = null;
+  map.getContainer().style.cursor = '';
+}
+
+// Switch shape kind: keep the current selection's footprint where it makes
+// sense (a rectangle and a circle can inherit each other's size) so the
+// selector feels like changing the shape, not starting over.
+function setShapeKind(kind) {
+  if (kind === shapeKind) return;
+  cancelPolyDraw();
+  shapeKind = kind;
+  document.querySelectorAll('#shape-seg button').forEach(function (b) {
+    b.classList.toggle('on', b.getAttribute('data-shape') === kind);
+  });
+  $('draw-btn').disabled = false;
+  $('draw-btn').textContent = SHAPE_LABELS[kind][shape && shape.kind === kind ? 1 : 0];
+  if (!shape) return;
+  var fr = TopoShape.frame(shape);
+  var c = TopoShape.centerLatLng(shape);
+  var halfU = (fr.maxU - fr.minU) / 2, halfV = (fr.maxV - fr.minV) / 2;
+  if (kind === 'rect')
+    finishShape(TopoShape.rect([c[1], c[0]], halfU, halfV,
+      shape.kind === 'rect' ? shape.rotation : 0));
+  else if (kind === 'circle')
+    finishShape(TopoShape.circle([c[1], c[0]], Math.min(halfU, halfV)));
+  else {
+    // seed a polygon from the current outline so there is something to edit
+    var ring = TopoShape.localRing(shape, fr).filter(function (_, i, a) {
+      return a.length <= 8 || i % Math.ceil(a.length / 8) === 0;
+    }).map(function (p) { return TopoShape.localToLngLat(fr, p[0], p[1]); });
+    finishShape(TopoShape.poly(ring));
+  }
 }
 
 // ---- pin-hole tool ------------------------------------------------------
@@ -268,8 +452,7 @@ var PIN_ICON = L.divIcon({
   className: 'pin-marker', iconSize: [16, 16], iconAnchor: [8, 8]
 });
 function insideBounds(latlng) {
-  return bounds && latlng.lat <= bounds.north && latlng.lat >= bounds.south &&
-         latlng.lng <= bounds.east && latlng.lng >= bounds.west;
+  return !!shape && TopoShape.containsLngLat(shape, latlng.lng, latlng.lat);
 }
 function updatePinStatus() {
   var el = $('pin-status');
@@ -294,6 +477,7 @@ function addPin(latlng) {
   updateShareURL();
 }
 function onMapClickForPin(e) {
+  if (activeTool === 'poly') { onMapClickForPoly(e.latlng); return; }
   if (activeTool !== 'pin') return;
   if (!insideBounds(e.latlng)) { toast('pins must be inside the box'); return; }
   addPin(e.latlng);
@@ -322,19 +506,22 @@ function applyLatLngBounds() {
     showError('longitude must be between -180 and 180'); return;
   }
   if (w > e) { var t = w; w = e; e = t; }   // normalize
-  finishBox(n, s, e, w);
+  setShapeKind('rect');
+  finishShape(TopoShape.fromBounds({ north: n, south: s, east: e, west: w }));
   if (map && map.fitBounds) {
     map.fitBounds([[s, w], [n, e]], { padding: [40, 40] });
   }
   log('box set from coordinates:', bounds);
 }
 
-// ---- depth/width ratio from the web-mercator box ----------------------
+// ---- depth/width ratio -------------------------------------------------
+// Measured in the shape's OWN frame, so it is the printed model's aspect:
+// for a rotated rectangle that is the rectangle's proportions, not its
+// north-up bounding box.
 function mercY(latDeg) { return Math.log(Math.tan(Math.PI / 4 + latDeg * Math.PI / 360)); }
 function getYXRatio() {
-  var yRange = mercY(bounds.north) - mercY(bounds.south);
-  var xRange = (bounds.east - bounds.west) * Math.PI / 180;
-  return yRange / xRange;
+  var fr = TopoShape.frame(shape);
+  return (fr.maxV - fr.minV) / (fr.maxU - fr.minU);
 }
 function updateHeight() {
   var w = $('model_width_cm'), h = $('model_height_cm');
@@ -373,11 +560,42 @@ function tileSettings() {
 function currentLayout() {
   var ts = tileSettings();
   var wcm = numOrNull('model_width_cm');
-  if (!ts || !bounds || wcm === null || wcm <= 0) return null;
+  if (!ts || !shape || wcm === null || wcm <= 0) return null;
   try {
-    return TopoTiling.computeLayout(bounds, wcm / 100, ts.maxWM, ts.maxDM,
-      ts.forceRows, ts.forceCols);
+    // a frame already carries minU/maxU/minV/maxV, so it IS the local box
+    return TopoTiling.computeLayout(TopoShape.frame(shape), wcm / 100,
+      ts.maxWM, ts.maxDM, ts.forceRows, ts.forceCols);
   } catch (e) { return null; }
+}
+
+// Seam segments to draw, clipped to the shape so a circle's cut lines stop
+// at its rim instead of running out across the bounding box. Sampling the
+// segment is enough for an overlay and works for any outline.
+function seamSegmentsLatLng(fr, layout) {
+  var segs = TopoTiling.seamLinesLocal(fr, layout.rows, layout.cols);
+  if (!TopoShape.needsMask(shape)) {
+    return segs.map(function (s) {
+      return s.map(function (p) {
+        var ll = TopoShape.localToLngLat(fr, p[0], p[1]);
+        return [ll[1], ll[0]];
+      });
+    });
+  }
+  var out = [];
+  segs.forEach(function (s) {
+    var STEPS = 160, run = null;
+    for (var i = 0; i <= STEPS; i++) {
+      var t = i / STEPS;
+      var u = s[0][0] + (s[1][0] - s[0][0]) * t;
+      var v = s[0][1] + (s[1][1] - s[0][1]) * t;
+      if (TopoShape.inside(shape, fr, u, v)) {
+        if (!run) { run = []; out.push(run); }
+        var ll = TopoShape.localToLngLat(fr, u, v);
+        run.push([ll[1], ll[0]]);
+      } else run = null;
+    }
+  });
+  return out.filter(function (r) { return r.length > 1; });
 }
 
 function updateTileOverlay() {
@@ -393,17 +611,11 @@ function updateTileOverlay() {
   if (!layout.fits) txt += ' — EXCEEDS the max tile size';
   summaryEl.textContent = txt;
   summaryEl.style.color = layout.fits ? '' : '#c62828';
-  // dashed seam lines inside the box show exactly where the terrain is cut
+  // dashed seam lines inside the shape show exactly where terrain is cut
   if (map && layout.count > 1 && L.polyline && L.layerGroup) {
-    var seams = TopoTiling.seamLines(bounds, layout.rows, layout.cols);
-    var lines = [];
-    seams.lngs.forEach(function (lng) {
-      lines.push(L.polyline([[bounds.south, lng], [bounds.north, lng]], SEAM_STYLE));
-    });
-    seams.lats.forEach(function (lat) {
-      lines.push(L.polyline([[lat, bounds.west], [lat, bounds.east]], SEAM_STYLE));
-    });
-    seamLayer = L.layerGroup(lines).addTo(map);
+    var lines = seamSegmentsLatLng(TopoShape.frame(shape), layout)
+      .map(function (seg) { return L.polyline(seg, SEAM_STYLE); });
+    if (lines.length) seamLayer = L.layerGroup(lines).addTo(map);
   }
 }
 
@@ -428,9 +640,9 @@ function makeMutex(aId, bId) {
   });
 }
 function maybeEnableBuild() {
-  // only a box and a width are required; z scaling defaults to
+  // only a shape and a width are required; z scaling defaults to
   // distortion 2 and lives under Advanced options / the preview sliders
-  var ok = bounds && $('model_width_cm').value !== '';
+  var ok = !!shape && !polyDraft && $('model_width_cm').value !== '';
   $('build').disabled = !ok;
   $('share-btn').disabled = !ok;
   updateShareURL();
@@ -475,6 +687,10 @@ function buildShareURL() {
     if ($('tile_cols').value) q.set('tcols', $('tile_cols').value);
   }
   if ($('elev_source').value !== 'aws') q.set('src', $('elev_source').value);
+  // a rotated rectangle, a circle or a polygon needs its own form; a plain
+  // rectangle is fully described by the n/s/e/w bounds already set above
+  var senc = TopoShape.encode(shape);
+  Object.keys(senc).forEach(function (k) { q.set(k, senc[k]); });
   var pinStr = pins.map(function (p) {
     var ll = p.getLatLng();
     return ll.lng.toFixed(5) + ',' + ll.lat.toFixed(5);
@@ -509,9 +725,14 @@ function applySharedParams() {
     $('elev_source').value = q.get('src');
     $('elev_source').dispatchEvent(new Event('change'));
   }
-  finishBox(+q.get('n'), +q.get('s'), +q.get('e'), +q.get('w'));
-  map.fitBounds([[+q.get('s'), +q.get('w')], [+q.get('n'), +q.get('e')]],
-    { padding: [40, 40] });
+  var shared = TopoShape.decode(function (k) { return q.get(k); });
+  if (!shared)
+    shared = TopoShape.fromBounds({ north: +q.get('n'), south: +q.get('s'),
+                                    east: +q.get('e'), west: +q.get('w') });
+  setShapeKind(shared.kind);
+  finishShape(shared);
+  var gb = TopoShape.geoBounds(shared);
+  map.fitBounds([[gb.south, gb.west], [gb.north, gb.east]], { padding: [40, 40] });
   (q.get('pins') || '').split(';').forEach(function (t) {
     var parts = t.split(',');
     if (parts.length === 2 && isFinite(+parts[0]) && isFinite(+parts[1]))
@@ -537,7 +758,10 @@ function buildModelConfig() {
     east: bounds.east, west: bounds.west,
     output_x_meters: parseFloat($('model_width_cm').value) / 100,
     top_thickness: t.top_thickness,
-    top_pad_width: $('tiled').checked ? 0 : t.top_pad_width,
+    // the flat rim pad is a rectangle feature: tiles butt against each
+    // other, and a circle/polygon rim has no box to pad outward
+    top_pad_width: ($('tiled').checked || TopoShape.needsMask(shape))
+      ? 0 : t.top_pad_width,
     wall_thickness: t.wall_thickness,
     upload_scale: 1,
     tiled: $('tiled').checked,
@@ -564,12 +788,112 @@ function buildModelConfig() {
   if (pinLocs.length < pins.length)
     toast((pins.length - pinLocs.length) + ' pin(s) outside the box were skipped');
   if (pinLocs.length) {
+    // pins are given to the mesh in the shape's LOCAL frame: a rotated
+    // selection's mesh axes are no longer absolute mercator
+    var pfr = TopoShape.frame(shape);
     model.pin_holes = {
       locations: pinLocs,
+      local: pinLocs.map(function (ll) {
+        return TopoShape.lngLatToLocal(pfr, ll[0], ll[1]);
+      }),
       diameter_mm: numOrNull('pin_diameter_mm') || 2.0
     };
   }
+  model.shape_kind = shape.kind;
+  model.rotation = shape.rotation || 0;
+  // the local frame the mesh is built on — the imagery drape needs it too
+  var mfr = TopoShape.frame(shape);
+  model.frame = { cx: mfr.cx, cy: mfr.cy, cos: mfr.cos, sin: mfr.sin };
+  model.local_box = { minU: mfr.minU, maxU: mfr.maxU,
+                      minV: mfr.minV, maxV: mfr.maxV };
   return model;
+}
+
+// ---- shape-aware sample grid -------------------------------------------
+// Builds the grid in the shape's local frame, clamps the grid points to
+// the printable triangle cap, and (for a circle or polygon) masks the
+// cells outside the shape and pulls the surviving outside corners onto
+// the true boundary. Mutates `model` with the mask and cell size.
+function prepareShapeGrid(model, maxPts, what, fr, localBox) {
+  fr = fr || TopoShape.frame(shape);
+  var masked = TopoShape.needsMask(shape);
+  function build(mp) {
+    if (localBox) {
+      var d = TopoShape.gridDims(localBox.maxU - localBox.minU,
+        localBox.maxV - localBox.minV, mp);
+      return TopoShape.sampleGrid(fr, localBox.minU, localBox.maxU,
+        localBox.minV, localBox.maxV, d.m, d.n);
+    }
+    return TopoShape.buildGrid(shape, mp, fr);
+  }
+  var grid = build(maxPts);
+  var mask = masked
+    ? TopoShape.cellMask(shape, fr, grid.uv, grid.m, grid.n) : null;
+  var cells = mask ? mask.kept : (grid.m - 1) * (grid.n - 1);
+  var mp2 = clampGridPoints(maxPts, 4 * cells, what);
+  if (mp2 !== maxPts) {
+    model.max_points_requested = maxPts;
+    model.max_points = mp2;
+    grid = build(mp2);
+    mask = masked
+      ? TopoShape.cellMask(shape, fr, grid.uv, grid.m, grid.n) : null;
+  }
+  if (mask) {
+    if (!mask.kept)
+      throw new Error('the shape covers no grid cells — enlarge it or raise the grid points');
+    log('boundary snap:',
+      TopoShape.snapBoundary(shape, fr, grid.uv, grid.m, grid.n, mask.cells));
+    model.cell_keep = mask.cells;
+    model.cell_u = grid.cellU;
+    model.cell_v = grid.cellV;
+  }
+  grid.mask = mask;
+  return grid;
+}
+
+// (x, y, elevation) in the shape's local frame — what the mesh is built on.
+function worldFromGrid(grid, elevs) {
+  var N = grid.m * grid.n;
+  var world = new Float64Array(N * 3);
+  for (var i = 0; i < N; i++) {
+    world[i * 3] = grid.uv[i * 2];
+    world[i * 3 + 1] = grid.uv[i * 2 + 1];
+    world[i * 3 + 2] = elevs[i];
+  }
+  if (grid.mask) neutralizeUnusedCells(world, grid.m, grid.n, grid.mask.cells);
+  return world;
+}
+
+// Is this grid vertex a corner of any surviving cell?
+function gridVertexUsed(cells, m, n, r, c) {
+  var cw = n - 1;
+  for (var dr = -1; dr <= 0; dr++)
+    for (var dc = -1; dc <= 0; dc++) {
+      var rr = r + dr, cc = c + dc;
+      if (rr < 0 || cc < 0 || rr >= m - 1 || cc >= n - 1) continue;
+      if (cells[rr * cw + cc]) return true;
+    }
+  return false;
+}
+
+// Grid points outside the shape never reach the mesh, but rescalePts still
+// scans the whole array to work out the elevation range. Parking them at
+// the mean of the used points stops terrain OUTSIDE the selection from
+// deciding the model's thickness or its distortion normalization.
+function neutralizeUnusedCells(world, m, n, cells) {
+  var cw = n - 1;
+  var used = new Uint8Array(m * n), r, c, i;
+  for (r = 0; r < m - 1; r++)
+    for (c = 0; c < cw; c++) {
+      if (!cells[r * cw + c]) continue;
+      used[r * n + c] = 1; used[r * n + c + 1] = 1;
+      used[(r + 1) * n + c] = 1; used[(r + 1) * n + c + 1] = 1;
+    }
+  var sum = 0, k = 0;
+  for (i = 0; i < m * n; i++) if (used[i]) { sum += world[i * 3 + 2]; k++; }
+  if (!k) return;
+  var mean = sum / k;
+  for (i = 0; i < m * n; i++) if (!used[i]) world[i * 3 + 2] = mean;
 }
 
 // ---- elevation cache ----------------------------------------------------
@@ -633,18 +957,18 @@ function clampGridPoints(maxPts, estTris, what) {
 // the effective max_points ceiling for the CURRENT box + tiling: the cap
 // binds the longer grid side, so it depends on the (tile) aspect ratio
 function gridCapForCurrentSetup() {
-  if (!bounds) return null;
-  var xR, yR;
-  try {
-    var a0 = Topo.project(bounds.west, bounds.south);
-    var b0 = Topo.project(bounds.east, bounds.north);
-    xR = b0[0] - a0[0]; yR = b0[1] - a0[1];
-  } catch (e) { return null; }
-  if (xR <= 0 || yR <= 0) return null;
+  if (!shape) return null;
+  var fr;
+  try { fr = TopoShape.frame(shape); } catch (e) { return null; }
+  var uR = fr.maxU - fr.minU, vR = fr.maxV - fr.minV;
+  if (uR <= 0 || vR <= 0) return null;
   var layout = currentLayout();
-  if (layout) { xR /= layout.cols; yR /= layout.rows; }
-  var aspect = Math.min(xR, yR) / Math.max(xR, yR);
-  return Math.min(2000, Math.floor(Math.sqrt(SOLID_TRI_CAP / (4 * aspect))));
+  if (layout) { uR /= layout.cols; vR /= layout.rows; }
+  var aspect = Math.min(uR, vR) / Math.max(uR, vR);
+  // a masked shape drops cells, so more grid points fit under the cap
+  var fill = shape.kind === 'circle' ? Math.PI / 4 : 1;
+  return Math.min(2000,
+    Math.floor(Math.sqrt(SOLID_TRI_CAP / (4 * aspect * fill))));
 }
 
 // keep the max_points hint honest: values above the printable cap are
@@ -775,13 +1099,10 @@ function doBuild() {
 
   if (model.tiled) { doBuildTiled(model, useGoogle, fetchOpts); return; }
 
-  var grid = Topo.buildLngLatGrid(model.north, model.south, model.west, model.east, model.max_points);
-  var mpClamped = clampGridPoints(model.max_points, 4 * grid.m * grid.n, 'the model');
-  if (mpClamped !== model.max_points) {
-    model.max_points_requested = model.max_points;
-    model.max_points = mpClamped;
-    grid = Topo.buildLngLatGrid(model.north, model.south, model.west, model.east, mpClamped);
-  }
+  var grid;
+  try {
+    grid = prepareShapeGrid(model, model.max_points, 'the model');
+  } catch (e) { setBuilding(false); showError(e.message); return; }
   var unit = useGoogle ? 'rows' : 'tiles';
 
   getElevations(model, grid, useGoogle, fetchOpts,
@@ -792,18 +1113,11 @@ function doBuild() {
     }).then(function (elev) {
     setProgress(0.65);
     $('building-label').textContent = 'Building mesh…';
-    var xy = Topo.projectPtsXY(grid.pts);
-    var N = grid.m * grid.n;
-    var world = new Float64Array(N * 3);
-    for (var i = 0; i < N; i++) {
-      world[i * 3] = xy[i * 2];
-      world[i * 3 + 1] = xy[i * 2 + 1];
-      world[i * 3 + 2] = elev.elevs[i];
-    }
-    var pMin = Topo.project(model.west, model.south);
-    var pMax = Topo.project(model.east, model.north);
+    // the mesh is built on the shape's own axes (see prepareShapeGrid), so
+    // a rotated selection still prints as an upright model
+    var world = worldFromGrid(grid, elev.elevs);
     var midLat = 0.5 * (model.north + model.south);
-    var gridSpacing = (pMax[0] - pMin[0]) / (grid.n - 1) * Math.cos(midLat * Math.PI / 180);
+    var gridSpacing = grid.cellU * Math.cos(midLat * Math.PI / 180);
 
     // keep everything the preview sliders need to re-mesh WITHOUT
     // re-fetching elevation tiles (world is copied — the original buffer
@@ -846,28 +1160,57 @@ function doBuildTiled(model, useGoogle, fetchOpts) {
     showError('Tiling is enabled but the max tile width/depth are missing.');
     return;
   }
-  var box = { north: model.north, south: model.south,
-              east: model.east, west: model.west };
+  var fr = TopoShape.frame(shape);
+  var masked = TopoShape.needsMask(shape);
   var layout, spec;
   try {
-    layout = TopoTiling.computeLayout(box, model.output_x_meters,
+    layout = TopoTiling.computeLayout(fr, model.output_x_meters,
       ts.maxWM, ts.maxDM, ts.forceRows, ts.forceCols);
-    spec = TopoTiling.buildGridSpec(box, layout.rows, layout.cols, model.max_points);
+    // The mask and the boundary snap run ONCE over the whole grid, before
+    // it is sliced — a per-tile snap could shorten a shared vertex's move
+    // differently on each side and open a seam.
+    var build = function (mp) {
+      var sp = TopoTiling.buildGridSpec(fr, fr, layout.rows, layout.cols, mp);
+      var perTile = (sp.mTile - 1) * (sp.nTile - 1);
+      if (masked) {
+        var mi = TopoTiling.maskGlobal(shape, sp);
+        if (!mi.kept)
+          throw new Error('the shape covers no grid cells — enlarge it or raise the grid points');
+        log('tiled boundary snap:', mi.snap);
+        perTile = Math.ceil(mi.kept / layout.count);
+      }
+      sp.perTileCells = perTile;
+      return sp;
+    };
+    spec = build(model.max_points);
     var mpClamped = clampGridPoints(model.max_points,
-      4 * spec.mTile * spec.nTile, 'each tile');
+      4 * spec.perTileCells, 'each tile');
     if (mpClamped !== model.max_points) {
       model.max_points_requested = model.max_points;
       model.max_points = mpClamped;
-      spec = TopoTiling.buildGridSpec(box, layout.rows, layout.cols, mpClamped);
+      spec = build(mpClamped);
     }
   } catch (e) { setBuilding(false); showError(e.message); return; }
   if (!layout.fits)
     toast('warning: tiles are larger than the max tile size — check the row/column overrides');
 
+  // tiles that fall entirely outside the shape are dropped, so a circle
+  // does not ship four empty corner pieces
   var slices = [];
-  for (var r = 0; r < layout.rows; r++)
-    for (var c = 0; c < layout.cols; c++)
-      slices.push(TopoTiling.tileSlice(spec, r, c));
+  for (var r = 0; r < layout.rows; r++) {
+    for (var c = 0; c < layout.cols; c++) {
+      var sl = TopoTiling.tileSlice(spec, r, c);
+      if (sl.cells && !sl.cells.keptCount) continue;
+      slices.push(sl);
+    }
+  }
+  if (!slices.length) {
+    setBuilding(false);
+    showError('no tile covers the shape — try a larger size or fewer tiles.');
+    return;
+  }
+  if (slices.length < layout.count)
+    toast((layout.count - slices.length) + ' tile(s) fell outside the shape and were skipped', 6000);
 
   // one zoom for every tile, chosen from the WHOLE box: adjacent tiles must
   // sample their shared edge from the same data, and per-tile choices could
@@ -912,13 +1255,20 @@ function doBuildTiled(model, useGoogle, fetchOpts) {
       TopoElev.despike(globalElevs, spec.NY, spec.NX, TopoElev.despikeThreshold(
         model.north, model.south, model.west, model.east, spec.NX));
 
+    // the model's elevation range comes only from points the mesh keeps:
+    // terrain in a circle's discarded corners must not set the thickness
     var zminG = Infinity, zmaxG = -Infinity;
-    for (var i = 0; i < globalElevs.length; i++) {
-      if (globalElevs[i] < zminG) zminG = globalElevs[i];
-      if (globalElevs[i] > zmaxG) zmaxG = globalElevs[i];
+    var gcw = spec.NX - 1;
+    for (var gj = 0; gj < spec.NY; gj++) {
+      for (var gk = 0; gk < spec.NX; gk++) {
+        if (spec.cells && !gridVertexUsed(spec.cells, spec.NY, spec.NX, gj, gk)) continue;
+        var gz = globalElevs[gj * spec.NX + gk];
+        if (gz < zminG) zminG = gz;
+        if (gz > zmaxG) zmaxG = gz;
+      }
     }
     var shared = TopoTiling.sharedZParams({
-      totalWidthM: model.output_x_meters, xRangeMerc: spec.xRangeMerc,
+      totalWidthM: model.output_x_meters, uRange: spec.uRange,
       zMin: zminG, zMax: zmaxG, topThickness: model.top_thickness,
       outputZMeters: model.output_z_meters,
       outputZDistortion: model.output_z_distortion,
@@ -945,30 +1295,40 @@ function doBuildTiled(model, useGoogle, fetchOpts) {
         tm.distortion_normalization_min = shared.dnMin;
         tm.distortion_normalization_max = shared.dnMax;
       }
-      var locs = [];
+      // each pin goes to the tile whose LOCAL box contains it (a rotated
+      // tile's lat/lng bbox is bigger than the tile itself)
+      var locs = [], localLocs = [];
       pinLocs.forEach(function (ll, pi) {
         if (pinTaken[pi]) return;
-        if (ll[0] >= t.bounds.west && ll[0] <= t.bounds.east &&
-            ll[1] >= t.bounds.south && ll[1] <= t.bounds.north) {
-          pinTaken[pi] = true; locs.push(ll);
+        var lp = TopoShape.lngLatToLocal(fr, ll[0], ll[1]);
+        if (lp[0] >= t.localBox.minU && lp[0] <= t.localBox.maxU &&
+            lp[1] >= t.localBox.minV && lp[1] <= t.localBox.maxV) {
+          pinTaken[pi] = true; locs.push(ll); localLocs.push(lp);
         }
       });
       if (locs.length)
-        tm.pin_holes = { locations: locs, diameter_mm: model.pin_holes.diameter_mm };
+        tm.pin_holes = { locations: locs, local: localLocs,
+                         diameter_mm: model.pin_holes.diameter_mm };
       else delete tm.pin_holes;
 
-      var xy = Topo.projectPtsXY(t.pts);
+      if (t.cells) {
+        tm.cell_keep = t.cells;
+        tm.cell_u = spec.cellU; tm.cell_v = spec.cellV;
+      } else {
+        delete tm.cell_keep;
+      }
+      tm.local_box = t.localBox;     // this tile's own frame box (imagery)
       var elevs = TopoTiling.sliceElevations(spec, globalElevs, t.r, t.c);
       var Npt = t.m * t.n;
       var world = new Float64Array(Npt * 3);
       for (var p = 0; p < Npt; p++) {
-        world[p * 3] = xy[p * 2];
-        world[p * 3 + 1] = xy[p * 2 + 1];
+        world[p * 3] = t.uv[p * 2];
+        world[p * 3 + 1] = t.uv[p * 2 + 1];
         world[p * 3 + 2] = elevs[p];
       }
-      var pMin = Topo.project(tm.west, tm.south), pMax = Topo.project(tm.east, tm.north);
-      var midLat = 0.5 * (tm.north + tm.south);
-      var gridSpacing = (pMax[0] - pMin[0]) / (t.n - 1) * Math.cos(midLat * Math.PI / 180);
+      if (t.cells) neutralizeUnusedCells(world, t.m, t.n, t.cells);
+      var midLat = 0.5 * (t.bounds.north + t.bounds.south);
+      var gridSpacing = spec.cellU * Math.cos(midLat * Math.PI / 180);
       return { model: tm, world: world, m: t.m, n: t.n, gridSpacing: gridSpacing,
                tile: { r: t.r, c: t.c, label: 'r' + (t.r + 1) + 'c' + (t.c + 1) } };
     });
@@ -976,7 +1336,7 @@ function doBuildTiled(model, useGoogle, fetchOpts) {
     // keep world COPIES before the originals are transferred to workers,
     // so the tuning sliders can re-mesh without re-fetching
     lastBuild = {
-      tiled: true, layout: layout, model: model, xRangeMerc: spec.xRangeMerc,
+      tiled: true, layout: layout, model: model, uRange: spec.uRange,
       shared: {
         zMin: zminG, zMax: zmaxG,
         autoMinZ: model.min_z_val === null || model.min_z_val === undefined,
@@ -1015,7 +1375,7 @@ function remeshTiled(fields) {
   var shared;
   try {
     shared = TopoTiling.sharedZParams({
-      totalWidthM: lb.model.output_x_meters, xRangeMerc: lb.xRangeMerc,
+      totalWidthM: lb.model.output_x_meters, uRange: lb.uRange,
       zMin: lb.shared.zMin, zMax: lb.shared.zMax,
       topThickness: lb.model.top_thickness,
       outputZDistortion: lb.shared.distortion,
@@ -1093,7 +1453,13 @@ function latToYFrac(lat) {
 // Python pad_image()): the mesh pads x and y by top_pad_width model-meters
 // and the planar UVs span the padded bounds, so the image needs the same
 // proportional border for the drape to line up.
+// A rotated model is meshed on its own axes, so its drape has to be
+// stitched in that frame too — a north-up image would sit on the solid at
+// an angle. Circles and polygons keep rotation 0, so their local box is
+// the geographic box and the north-up path below still applies.
 function stitchSatelliteTexture(model, onProgress) {
+  if (Math.abs(model.rotation || 0) > 1e-9 && model.frame && model.local_box)
+    return stitchRotatedTexture(model, onProgress);
   var xf0 = lngToXFrac(model.west), xf1 = lngToXFrac(model.east);
   var yf0 = latToYFrac(model.north), yf1 = latToYFrac(model.south);
   var padFrac = (model.top_pad_width || 0) / model.output_x_meters;
@@ -1134,6 +1500,81 @@ function stitchSatelliteTexture(model, onProgress) {
       if (onProgress) onProgress(done, jobs.length);
     });
   })).then(function () {
+    return new Promise(function (resolve, reject) {
+      canvas.toBlob(function (blob) {
+        if (blob) resolve({ blob: blob, canvas: canvas,
+                            width: canvas.width, height: canvas.height, zoom: z });
+        else reject(new Error('could not encode the texture image'));
+      }, 'image/jpeg', 0.9);
+    });
+  });
+}
+
+// Imagery for a rotated frame: the canvas spans the model's LOCAL box, and
+// the mercator tiles are drawn through one affine transform that carries
+// world-pixel coordinates into it (rotation included), so the tiles land
+// rotated and the drape lines up with the mesh's planar UVs.
+//
+// world pixel -> mercator is linear:  mx = k*wx - piR,  my = piR - k*wy
+// mercator -> canvas is the local frame, scaled:
+//   px = s*(( mx-cx)cos + (my-cy)sin - minU) + padPx
+//   py = s*(maxV - (-(mx-cx)sin + (my-cy)cos)) + padPx
+// Composing the two gives the setTransform() coefficients below.
+function stitchRotatedTexture(model, onProgress) {
+  var fr = model.frame, lb = model.local_box;
+  var R = 6378137, TWO_PI_R = 2 * Math.PI * R, piR = Math.PI * R;
+  var uRange = lb.maxU - lb.minU, vRange = lb.maxV - lb.minV;
+  var padFrac = (model.top_pad_width || 0) / model.output_x_meters;
+  var budget = Math.floor(MAX_TEXTURE_PX / (1 + 2 * padFrac));
+  var z = SAT_MAX_ZOOM, k;
+  while (z > 1) {
+    k = TWO_PI_R / (256 * Math.pow(2, z));       // mercator metres per world px
+    if (uRange / k <= budget && vRange / k <= budget) break;
+    z--;
+  }
+  k = TWO_PI_R / (256 * Math.pow(2, z));
+  var s = 1 / k;                                  // canvas px per mercator metre
+  var W = Math.max(1, Math.round(uRange * s)), H = Math.max(1, Math.round(vRange * s));
+  var padPx = Math.round(W * padFrac);
+  var canvas = document.createElement('canvas');
+  canvas.width = W + 2 * padPx; canvas.height = H + 2 * padPx;
+  var ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  var A = s * fr.cos, B = s * fr.sin, C = s * fr.sin, D = -s * fr.cos;
+  var E = s * (-fr.cx * fr.cos - fr.cy * fr.sin - lb.minU) + padPx;
+  var F = s * (lb.maxV - fr.cx * fr.sin + fr.cy * fr.cos) + padPx;
+  ctx.setTransform(A * k, B * k, -C * k, -D * k,
+                   -A * piR + C * piR + E, -B * piR + D * piR + F);
+
+  // which world pixels are needed: the local box's four corners
+  var wx0 = Infinity, wx1 = -Infinity, wy0 = Infinity, wy1 = -Infinity;
+  [[lb.minU, lb.minV], [lb.minU, lb.maxV],
+   [lb.maxU, lb.minV], [lb.maxU, lb.maxV]].forEach(function (p) {
+    var mp = TopoShape.toMerc(fr, p[0], p[1]);
+    var wx = (mp[0] + piR) / k, wy = (piR - mp[1]) / k;
+    if (wx < wx0) wx0 = wx; if (wx > wx1) wx1 = wx;
+    if (wy < wy0) wy0 = wy; if (wy > wy1) wy1 = wy;
+  });
+  var nTiles = Math.pow(2, z);
+  var tx0 = Math.floor(wx0 / 256), tx1 = Math.floor((wx1 - 1e-9) / 256);
+  var ty0 = Math.max(0, Math.floor(wy0 / 256));
+  var ty1 = Math.min(nTiles - 1, Math.floor((wy1 - 1e-9) / 256));
+  var jobs = [];
+  for (var ty = ty0; ty <= ty1; ty++)
+    for (var tx = tx0; tx <= tx1; tx++) jobs.push({ tx: tx, ty: ty });
+  var done = 0;
+  return Promise.all(jobs.map(function (j) {
+    var wrappedX = ((j.tx % nTiles) + nTiles) % nTiles;   // antimeridian
+    return TopoSat.loadTile(TopoSat.tileUrl(z, wrappedX, j.ty)).then(function (img) {
+      // +1px overdraw hides seams left by the rotated resampling
+      ctx.drawImage(img, j.tx * 256, j.ty * 256, 257, 257);
+      done++;
+      if (onProgress) onProgress(done, jobs.length);
+    });
+  })).then(function () {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
     return new Promise(function (resolve, reject) {
       canvas.toBlob(function (blob) {
         if (blob) resolve({ blob: blob, canvas: canvas,
@@ -1186,7 +1627,12 @@ var tileStlUrls = [];   // per-tile STL object URLs (revoked on next preview)
 
 function texKey(model) {
   var padFrac = (model.top_pad_width || 0) / model.output_x_meters;
-  return bboxKey(model) + '|' + padFrac.toFixed(6);
+  var lb = model.local_box;
+  return bboxKey(model) + '|' + padFrac.toFixed(6) +
+    '|' + (model.rotation || 0).toFixed(4) +
+    (lb ? '|' + [lb.minU, lb.maxU, lb.minV, lb.maxV].map(function (x) {
+      return x.toFixed(2);
+    }).join(',') : '');
 }
 
 function ensureTexture(model, onProgress) {
@@ -1450,7 +1896,9 @@ function showPreview(d, preserveView) {
   add('grid spacing (m)', d.grid_spacing_m.toFixed(1));
   if (d.resolution) add('data resolution (m)', '~' + d.resolution.median +
     (d.zoom ? ' (zoom ' + d.zoom + ')' : ' (Google)'));
-  if (d.model.pin_holes)
+  if (d.model.pin_holes && d.info && d.info.pin_holes_unsupported)
+    add('pin holes', 'skipped — pin holes need a rectangular selection');
+  else if (d.model.pin_holes)
     add('pin holes', d.model.pin_holes.locations.length + ' × ø' +
         d.model.pin_holes.diameter_mm + ' mm, vertical guide collar on slopes');
   if (d.resolution && d.resolution.median > 2 * d.grid_spacing_m)
@@ -1830,7 +2278,12 @@ document.addEventListener('DOMContentLoaded', function () {
   if (vm) $('build-ver').textContent = '· build ' + vm[1];
   initMap();
   openSidebar();   // start expanded; no-op on desktop, shows the form first on mobile
+  document.querySelectorAll('#shape-seg button').forEach(function (b) {
+    b.addEventListener('click', function () { setShapeKind(b.getAttribute('data-shape')); });
+  });
   $('draw-btn').addEventListener('click', function () {
+    if (activeTool === 'poly') { finishPolyDraw(); return; }
+    if (shapeKind === 'poly') { startPolyDraw(); return; }
     if (sidebarIsDrawer()) {
       // mobile flow: 1) close the drawer so the user can pan/zoom to the
       // area they want, 2) they tap the toast button to pop the box there,
@@ -1838,9 +2291,11 @@ document.addEventListener('DOMContentLoaded', function () {
       // deliberately NOT placed yet — placing it before the user has
       // navigated just makes them drag it across the world.
       closeSidebar();
-      actionToast('Pan and zoom to your area', 'PLACE BOX HERE', placeBox);
+      actionToast('Pan and zoom to your area',
+        shapeKind === 'circle' ? 'PLACE CIRCLE HERE' : 'PLACE RECTANGLE HERE',
+        placeShape);
     } else {
-      placeBox();   // desktop: the map was visible all along, place now
+      placeShape();   // desktop: the map was visible all along, place now
     }
   });
   $('pin-btn').addEventListener('click', function () {
