@@ -56,7 +56,8 @@ nothing to restrict or protect; anyone can use the deployed URL directly.
 ## Tiling (models bigger than one print)
 
 Check **Tile into multiple prints**, enter the largest piece your printer or
-service can produce (e.g. Shapeways clear resin 75×75 cm, SLS nylon 66×55),
+service can produce (the defaults, 65×35 cm, fit Shapeways' SLS nylon
+650×350×550 mm build volume),
 and set any total width — the app splits the box into the smallest grid of
 uniform tiles that fit, shows the cut lines on the map, and builds one STL
 per tile. Tiles assemble seamlessly because everything that affects the seams
