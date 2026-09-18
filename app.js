@@ -382,6 +382,7 @@ function currentLayout() {
 
 function updateTileOverlay() {
   var summaryEl = $('tile-summary');
+  updateGridHint();
   if (seamLayer && map) { map.removeLayer(seamLayer); seamLayer = null; }
   var layout = currentLayout();
   if (!layout) { if (summaryEl) summaryEl.textContent = ''; return; }
@@ -623,9 +624,40 @@ function clampGridPoints(maxPts, estTris, what) {
   if (estTris <= SOLID_TRI_CAP) return maxPts;
   var mp2 = Math.max(2, Math.floor(maxPts * Math.sqrt(SOLID_TRI_CAP / estTris)));
   toast('grid points clamped to ' + mp2 + ' — ' + what +
-    ' is at the ~1M-triangle printable cap; for more total detail use smaller tiles');
+    ' is at the ~1M-triangle printable cap; for more total detail use smaller tiles',
+    8000);
   log('grid clamp:', maxPts, '->', mp2, '(', estTris, 'estimated triangles )');
   return mp2;
+}
+
+// the effective max_points ceiling for the CURRENT box + tiling: the cap
+// binds the longer grid side, so it depends on the (tile) aspect ratio
+function gridCapForCurrentSetup() {
+  if (!bounds) return null;
+  var xR, yR;
+  try {
+    var a0 = Topo.project(bounds.west, bounds.south);
+    var b0 = Topo.project(bounds.east, bounds.north);
+    xR = b0[0] - a0[0]; yR = b0[1] - a0[1];
+  } catch (e) { return null; }
+  if (xR <= 0 || yR <= 0) return null;
+  var layout = currentLayout();
+  if (layout) { xR /= layout.cols; yR /= layout.rows; }
+  var aspect = Math.min(xR, yR) / Math.max(xR, yR);
+  return Math.min(2000, Math.floor(Math.sqrt(SOLID_TRI_CAP / (4 * aspect))));
+}
+
+// keep the max_points hint honest: values above the printable cap are
+// clamped at build time, so say where that ceiling sits right now
+function updateGridHint() {
+  var el = $('mp-hint');
+  if (!el) return;
+  var base = 'higher = more detail, bigger STL, more tiles fetched';
+  var cap = gridCapForCurrentSetup();
+  el.textContent = (cap && cap < 2000)
+    ? base + ' — values above ~' + cap + (currentLayout() ? ' per tile' : '') +
+      ' are clamped (1M-triangle print cap)'
+    : base;
 }
 
 // one tile (or the whole untiled model) through the mesh worker
@@ -746,6 +778,7 @@ function doBuild() {
   var grid = Topo.buildLngLatGrid(model.north, model.south, model.west, model.east, model.max_points);
   var mpClamped = clampGridPoints(model.max_points, 4 * grid.m * grid.n, 'the model');
   if (mpClamped !== model.max_points) {
+    model.max_points_requested = model.max_points;
     model.max_points = mpClamped;
     grid = Topo.buildLngLatGrid(model.north, model.south, model.west, model.east, mpClamped);
   }
@@ -823,6 +856,7 @@ function doBuildTiled(model, useGoogle, fetchOpts) {
     var mpClamped = clampGridPoints(model.max_points,
       4 * spec.mTile * spec.nTile, 'each tile');
     if (mpClamped !== model.max_points) {
+      model.max_points_requested = model.max_points;
       model.max_points = mpClamped;
       spec = TopoTiling.buildGridSpec(box, layout.rows, layout.cols, mpClamped);
     }
@@ -1408,7 +1442,11 @@ function showPreview(d, preserveView) {
   add('triangles', d.num_faces.toLocaleString());
   add('size (mm)', d.size_mm.map(function (x) { return x.toFixed(1); }).join(' × '));
   if (d.volume_cm3) add('material volume', fmtVolume(d.volume_cm3));
-  add('grid', d.model.max_points + ' pts → ' + d.num_vertices.toLocaleString() + ' vertices');
+  add('grid', d.model.max_points + ' pts' +
+    (d.model.max_points_requested
+      ? ' (clamped from ' + d.model.max_points_requested + ' — 1M-triangle print cap)'
+      : '') +
+    ' → ' + d.num_vertices.toLocaleString() + ' vertices');
   add('grid spacing (m)', d.grid_spacing_m.toFixed(1));
   if (d.resolution) add('data resolution (m)', '~' + d.resolution.median +
     (d.zoom ? ' (zoom ' + d.zoom + ')' : ' (Google)'));
@@ -1614,6 +1652,11 @@ function showPreviewTiled(ds, layout, preserveView) {
   add('tile size (cm)', '≤ ' + (layout.tileWidthM * 100).toFixed(1) +
     ' × ' + (layout.tileDepthM * 100).toFixed(1));
   add('triangles (total)', ds.reduce(function (s, d) { return s + d.num_faces; }, 0).toLocaleString());
+  add('grid points (per tile)', d0.model.max_points +
+    (d0.model.max_points_requested
+      ? ' (clamped from ' + d0.model.max_points_requested +
+        ' — 1M-triangle print cap; use smaller tiles for more total detail)'
+      : ''));
   var totalVol = ds.reduce(function (s, d) { return s + (d.volume_cm3 || 0); }, 0);
   if (totalVol) add('material volume (total)', fmtVolume(totalVol) +
     ' — most print services price mainly on this');
