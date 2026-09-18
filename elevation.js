@@ -171,11 +171,15 @@
         if (!showBathymetry && e < 0) e = 0;
         elevs[p] = e;
       }
-      // grid spacing on the ground, for the despike threshold
+      // grid spacing on the ground, for the despike threshold. Tiled
+      // builds pass noDespike and despike the assembled GLOBAL grid
+      // instead: per-tile despiking would repair a spike near a seam
+      // differently on the two tiles that share that edge.
       var midLat = 0.5 * (north + south);
       var widthM = Math.abs(east - west) * (Math.PI / 180) * 6378137 *
         Math.cos(midLat * Math.PI / 180);
-      despike(elevs, m, n, Math.max(500, 4 * widthM / Math.max(n - 1, 1)));
+      if (!opts.noDespike)
+        despike(elevs, m, n, Math.max(500, 4 * widthM / Math.max(n - 1, 1)));
       var res = groundResolution(0.5 * (north + south), z);
       var rr = Math.round(res * 10) / 10;
       return { elevs: elevs, resolution: { min: rr, median: rr, max: rr }, zoom: z };
@@ -223,6 +227,12 @@
   var Elev = {
     fetchElevations: fetchElevations,
     chooseZoom: chooseZoom,
+    despike: despike,
+    despikeThreshold: function (north, south, west, east, cols) {
+      var widthM = Math.abs(east - west) * (Math.PI / 180) * 6378137 *
+        Math.cos(0.5 * (north + south) * Math.PI / 180);
+      return Math.max(500, 4 * widthM / Math.max(cols - 1, 1));
+    },
     tileURL: tileURL,
     loadTile: defaultLoadTile,      // swappable for tests
     _sampleTile: sampleTile,

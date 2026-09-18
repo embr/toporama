@@ -53,10 +53,28 @@ nothing to restrict or protect; anyone can use the deployed URL directly.
 - **Box editing.** After drawing, "redraw" replaces the box (there are no drag
   handles to resize it in place yet). The lat/long entry covers precise boxes.
 
+## Tiling (models bigger than one print)
+
+Check **Tile into multiple prints**, enter the largest piece your printer or
+service can produce (e.g. Shapeways clear resin 75×75 cm, SLS nylon 66×55),
+and set any total width — the app splits the box into the smallest grid of
+uniform tiles that fit, shows the cut lines on the map, and builds one STL
+per tile. Tiles assemble seamlessly because everything that affects the seams
+is computed globally (see `tiling.js`): one shared sample grid (adjacent tiles
+reuse bit-identical boundary points), one elevation despike pass over the
+assembled grid, one z scale/distortion, one distortion-normalization range,
+and one base height. The preview shows the assembled model with a
+checkerboard tint and an **exploded** toggle; the download is a zip of STLs
+(or per-tile Shapeways color zips with the satellite overlay on) plus a
+`layout.txt` assembly map. Advanced options let you force the tile grid
+(rows/columns) or override the shared z values, e.g. to match tiles from an
+earlier build.
+
 ## Tests
 
 ```bash
 node test/smoke.mjs
+node test/tiling.mjs
 ```
 
 Stubs Leaflet + three.js and injects a synthetic terrarium tile, then drives

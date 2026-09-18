@@ -341,11 +341,80 @@ function updateHeight() {
   if (!bounds || w.value === '') return;
   h.value = Math.round(parseFloat(w.value) * getYXRatio() * 100) / 100;
   h.disabled = false;
+  updateTileOverlay();   // box or size changed — seams and summary move
 }
 function updateWidth() {
   var w = $('model_width_cm'), h = $('model_height_cm');
   if (!bounds || h.value === '') return;
   w.value = Math.round(parseFloat(h.value) / getYXRatio() * 100) / 100;
+}
+
+// ---- tiling ------------------------------------------------------------
+// "Tile into multiple prints" splits the model into a rows × cols grid of
+// separately printable solids that assemble seamlessly. The math lives in
+// tiling.js; here we read the form, keep a live summary + seam overlay on
+// the map, and orchestrate the multi-tile build.
+var seamLayer = null;
+var SEAM_STYLE = { color: '#4a4a4a', weight: 2, dashArray: '6 6',
+                   interactive: false };
+
+function tileSettings() {
+  if (!$('tiled').checked) return null;
+  var mw = numOrNull('tile_max_w_cm'), md = numOrNull('tile_max_d_cm');
+  if (mw === null || md === null || mw <= 0 || md <= 0) return null;
+  var fr = numOrNull('tile_rows'), fc = numOrNull('tile_cols');
+  return {
+    maxWM: mw / 100, maxDM: md / 100,
+    forceRows: fr ? Math.max(1, Math.round(fr)) : null,
+    forceCols: fc ? Math.max(1, Math.round(fc)) : null
+  };
+}
+
+function currentLayout() {
+  var ts = tileSettings();
+  var wcm = numOrNull('model_width_cm');
+  if (!ts || !bounds || wcm === null || wcm <= 0) return null;
+  try {
+    return TopoTiling.computeLayout(bounds, wcm / 100, ts.maxWM, ts.maxDM,
+      ts.forceRows, ts.forceCols);
+  } catch (e) { return null; }
+}
+
+function updateTileOverlay() {
+  var summaryEl = $('tile-summary');
+  if (seamLayer && map) { map.removeLayer(seamLayer); seamLayer = null; }
+  var layout = currentLayout();
+  if (!layout) { if (summaryEl) summaryEl.textContent = ''; return; }
+  var txt = layout.cols + ' × ' + layout.rows + ' = ' + layout.count +
+    (layout.count > 1 ? ' tiles' : ' tile') + ', each ' +
+    (layout.tileWidthM * 100).toFixed(1) + ' × ' +
+    (layout.tileDepthM * 100).toFixed(1) + ' cm';
+  if (!layout.fits) txt += ' — EXCEEDS the max tile size';
+  summaryEl.textContent = txt;
+  summaryEl.style.color = layout.fits ? '' : '#c62828';
+  // dashed seam lines inside the box show exactly where the terrain is cut
+  if (map && layout.count > 1 && L.polyline && L.layerGroup) {
+    var seams = TopoTiling.seamLines(bounds, layout.rows, layout.cols);
+    var lines = [];
+    seams.lngs.forEach(function (lng) {
+      lines.push(L.polyline([[bounds.south, lng], [bounds.north, lng]], SEAM_STYLE));
+    });
+    seams.lats.forEach(function (lat) {
+      lines.push(L.polyline([[lat, bounds.west], [lat, bounds.east]], SEAM_STYLE));
+    });
+    seamLayer = L.layerGroup(lines).addTo(map);
+  }
+}
+
+// tiling on/off changes what the form allows: the 55 cm single-print cap
+// on width/depth is lifted (that's the whole point), and the tile-size
+// fields appear
+function applyTiledUI() {
+  var on = $('tiled').checked;
+  $('tile-opts').style.display = on ? '' : 'none';
+  $('model_width_cm').max = on ? 10000 : 55;
+  $('model_height_cm').max = on ? 10000 : 55;
+  updateTileOverlay();
 }
 
 // ---- form logic -------------------------------------------------------
@@ -397,7 +466,13 @@ function buildShareURL() {
   if (style !== 'plain') q.set('style', style);
   if ($('show_bathymetry').checked) q.set('bath', '1');
   if ($('overlay').checked) q.set('sat', '1');
-  if ($('tiled').checked) q.set('tiled', '1');
+  if ($('tiled').checked) {
+    q.set('tiled', '1');
+    if ($('tile_max_w_cm').value) q.set('tw', $('tile_max_w_cm').value);
+    if ($('tile_max_d_cm').value) q.set('td', $('tile_max_d_cm').value);
+    if ($('tile_rows').value) q.set('trows', $('tile_rows').value);
+    if ($('tile_cols').value) q.set('tcols', $('tile_cols').value);
+  }
   if ($('elev_source').value !== 'aws') q.set('src', $('elev_source').value);
   var pinStr = pins.map(function (p) {
     var ll = p.getLatLng();
@@ -426,6 +501,9 @@ function applySharedParams() {
   $('show_bathymetry').checked = q.get('bath') === '1';
   $('overlay').checked = q.get('sat') === '1';
   $('tiled').checked = q.get('tiled') === '1';
+  setV('tile_max_w_cm', 'tw'); setV('tile_max_d_cm', 'td');
+  setV('tile_rows', 'trows'); setV('tile_cols', 'tcols');
+  applyTiledUI();   // before finishBox so the width cap is already lifted
   if (q.get('src')) {
     $('elev_source').value = q.get('src');
     $('elev_source').dispatchEvent(new Event('change'));
@@ -505,13 +583,14 @@ function buildModelConfig() {
 // hang risk; persistence can be revisited behind a hard guard later.)
 var elevMem = new Map();
 
-function elevKey(model, grid, useGoogle) {
+function elevKey(model, grid, useGoogle, fetchOpts) {
   return [useGoogle ? 'g' : 'a', model.show_bathymetry ? 1 : 0,
+    (fetchOpts && fetchOpts.zoom) || 0, (fetchOpts && fetchOpts.noDespike) ? 1 : 0,
     grid.m, grid.n, model.north.toFixed(6), model.south.toFixed(6),
     model.east.toFixed(6), model.west.toFixed(6)].join('|');
 }
 function getElevations(model, grid, useGoogle, fetchOpts, onProgress) {
-  var key = elevKey(model, grid, useGoogle);
+  var key = elevKey(model, grid, useGoogle, fetchOpts);
   if (elevMem.has(key)) {
     log('elevation cache hit');
     return Promise.resolve(elevMem.get(key));
@@ -534,8 +613,45 @@ function setProgress(frac) { $('building-bar').style.width = Math.round(frac * 1
 // re-mesh with a different distortion/exponent without re-fetching tiles
 var lastBuild = null;
 
+// one tile (or the whole untiled model) through the mesh worker
+function runWorkerBuild(model, worldBuf, m, n) {
+  return new Promise(function (resolve, reject) {
+    var worker = new Worker('worker.js');
+    worker.onmessage = function (ev) {
+      worker.terminate();
+      if (!ev.data.ok) reject(new Error(ev.data.error));
+      else resolve(ev.data);
+    };
+    worker.onerror = function (er) {
+      worker.terminate();
+      reject(new Error(er.message || 'worker error'));
+    };
+    worker.postMessage({ model: model, world: worldBuf, m: m, n: n }, [worldBuf]);
+  });
+}
+
+// sequential worker builds for a list of tiles; each entry carries a
+// transferable world copy (the caller keeps its own copies for re-meshes)
+function buildTilesThroughWorkers(tiles, onStart) {
+  var ds = [];
+  var chain = Promise.resolve();
+  tiles.forEach(function (t, i) {
+    chain = chain.then(function () {
+      if (onStart) onStart(i);
+      return runWorkerBuild(t.model, t.world.buffer, t.m, t.n).then(function (d) {
+        d.grid_spacing_m = t.gridSpacing;
+        d.model = t.model;
+        d.tile = t.tile;
+        ds.push(d);
+      });
+    });
+  });
+  return chain.then(function () { return ds; });
+}
+
 function remesh(fields) {
   if (!lastBuild) return;
+  if (lastBuild.tiled) { remeshTiled(fields); return; }
   var model2 = {};
   for (var k in lastBuild.model) model2[k] = lastBuild.model[k];
   for (k in fields) model2[k] = fields[k];
@@ -593,7 +709,6 @@ function doBuild() {
   var model;
   try { model = buildModelConfig(); } catch (e) { showError(e.message); return; }
 
-  var grid = Topo.buildLngLatGrid(model.north, model.south, model.west, model.east, model.max_points);
   setBuilding(true, 'Fetching elevation…');
   setProgress(0);
 
@@ -610,6 +725,10 @@ function doBuild() {
       return;
     }
   }
+
+  if (model.tiled) { doBuildTiled(model, useGoogle, fetchOpts); return; }
+
+  var grid = Topo.buildLngLatGrid(model.north, model.south, model.west, model.east, model.max_points);
   var unit = useGoogle ? 'rows' : 'tiles';
 
   getElevations(model, grid, useGoogle, fetchOpts,
@@ -659,6 +778,223 @@ function doBuild() {
   }).catch(function (err) {
     setBuilding(false);
     showError(err.message + '\n(Could not fetch elevation tiles — check your connection and try again.)');
+  });
+}
+
+// ---- tiled build --------------------------------------------------------
+// Splits the box per the Tiling settings and builds one solid per tile.
+// Every per-tile model shares the global z parameters (see tiling.js), and
+// tiled solids keep absolute coordinates (worker skips centerAtOrigin), so
+// the previews assemble themselves and printed tiles mate exactly.
+function doBuildTiled(model, useGoogle, fetchOpts) {
+  var ts = tileSettings();
+  if (!ts) {
+    setBuilding(false);
+    showError('Tiling is enabled but the max tile width/depth are missing.');
+    return;
+  }
+  var box = { north: model.north, south: model.south,
+              east: model.east, west: model.west };
+  var layout, spec;
+  try {
+    layout = TopoTiling.computeLayout(box, model.output_x_meters,
+      ts.maxWM, ts.maxDM, ts.forceRows, ts.forceCols);
+    spec = TopoTiling.buildGridSpec(box, layout.rows, layout.cols, model.max_points);
+  } catch (e) { setBuilding(false); showError(e.message); return; }
+  if (!layout.fits)
+    toast('warning: tiles are larger than the max tile size — check the row/column overrides');
+
+  var slices = [];
+  for (var r = 0; r < layout.rows; r++)
+    for (var c = 0; c < layout.cols; c++)
+      slices.push(TopoTiling.tileSlice(spec, r, c));
+
+  // one zoom for every tile, chosen from the WHOLE box: adjacent tiles must
+  // sample their shared edge from the same data, and per-tile choices could
+  // differ near a zoom transition. The download budget scales with the tile
+  // count because each tile fetches its own cover.
+  fetchOpts = Object.assign({}, fetchOpts);
+  if (!useGoogle) {
+    fetchOpts.zoom = TopoElev.chooseZoom(model.north, model.south,
+      model.west, model.east, spec.NX, 160 * layout.count);
+    fetchOpts.noDespike = true;   // despiked once globally below
+  }
+  var unit = useGoogle ? 'rows' : 'tiles';
+  var N = layout.count;
+  var globalElevs = new Float64Array(spec.NY * spec.NX);
+  var resolution = null, zoomUsed = null;
+
+  var chain = Promise.resolve();
+  slices.forEach(function (t, i) {
+    chain = chain.then(function () {
+      var pseudo = { north: t.bounds.north, south: t.bounds.south,
+                     east: t.bounds.east, west: t.bounds.west,
+                     show_bathymetry: model.show_bathymetry };
+      return getElevations(pseudo, { pts: t.pts, m: t.m, n: t.n }, useGoogle,
+        fetchOpts, function (done, total) {
+          setProgress((i + done / total) / N * 0.55);
+          $('building-label').textContent = 'Tile ' + (i + 1) + '/' + N +
+            ' — fetching elevation ' + unit + ' (' + done + '/' + total + ')…';
+        }).then(function (elev) {
+          TopoTiling.placeElevations(spec, globalElevs, elev.elevs, t.r, t.c);
+          resolution = elev.resolution; zoomUsed = elev.zoom;
+        });
+    });
+  });
+
+  chain.then(function () {
+    $('building-label').textContent = 'Preparing tiles…';
+    setProgress(0.55);
+    // despike the ASSEMBLED grid so a bad pixel near a seam is repaired
+    // identically on both sides (per-tile despiking sees different
+    // neighborhoods at the boundary)
+    if (!useGoogle)
+      TopoElev.despike(globalElevs, spec.NY, spec.NX, TopoElev.despikeThreshold(
+        model.north, model.south, model.west, model.east, spec.NX));
+
+    var zminG = Infinity, zmaxG = -Infinity;
+    for (var i = 0; i < globalElevs.length; i++) {
+      if (globalElevs[i] < zminG) zminG = globalElevs[i];
+      if (globalElevs[i] > zmaxG) zmaxG = globalElevs[i];
+    }
+    var shared = TopoTiling.sharedZParams({
+      totalWidthM: model.output_x_meters, xRangeMerc: spec.xRangeMerc,
+      zMin: zminG, zMax: zmaxG, topThickness: model.top_thickness,
+      outputZMeters: model.output_z_meters,
+      outputZDistortion: model.output_z_distortion,
+      userMinZ: model.min_z_val,
+      userDnMin: model.distortion_normalization_min,
+      userDnMax: model.distortion_normalization_max,
+      exponent: model.distortion_exponent
+    });
+
+    // each pin goes to exactly one tile (the first that contains it)
+    var pinLocs = (model.pin_holes && model.pin_holes.locations) || [];
+    var pinTaken = pinLocs.map(function () { return false; });
+
+    var tiles = slices.map(function (t) {
+      var tm = {};
+      for (var k in model) tm[k] = model[k];
+      tm.north = t.bounds.north; tm.south = t.bounds.south;
+      tm.east = t.bounds.east; tm.west = t.bounds.west;
+      tm.output_x_meters = model.output_x_meters / layout.cols;
+      delete tm.output_z_meters;             // z is set via the SHARED distortion
+      tm.output_z_distortion = shared.distortion;
+      tm.min_z_val = shared.minZVal;
+      if (shared.dnMin !== null && shared.dnMin !== undefined) {
+        tm.distortion_normalization_min = shared.dnMin;
+        tm.distortion_normalization_max = shared.dnMax;
+      }
+      var locs = [];
+      pinLocs.forEach(function (ll, pi) {
+        if (pinTaken[pi]) return;
+        if (ll[0] >= t.bounds.west && ll[0] <= t.bounds.east &&
+            ll[1] >= t.bounds.south && ll[1] <= t.bounds.north) {
+          pinTaken[pi] = true; locs.push(ll);
+        }
+      });
+      if (locs.length)
+        tm.pin_holes = { locations: locs, diameter_mm: model.pin_holes.diameter_mm };
+      else delete tm.pin_holes;
+
+      var xy = Topo.projectPtsXY(t.pts);
+      var elevs = TopoTiling.sliceElevations(spec, globalElevs, t.r, t.c);
+      var Npt = t.m * t.n;
+      var world = new Float64Array(Npt * 3);
+      for (var p = 0; p < Npt; p++) {
+        world[p * 3] = xy[p * 2];
+        world[p * 3 + 1] = xy[p * 2 + 1];
+        world[p * 3 + 2] = elevs[p];
+      }
+      var pMin = Topo.project(tm.west, tm.south), pMax = Topo.project(tm.east, tm.north);
+      var midLat = 0.5 * (tm.north + tm.south);
+      var gridSpacing = (pMax[0] - pMin[0]) / (t.n - 1) * Math.cos(midLat * Math.PI / 180);
+      return { model: tm, world: world, m: t.m, n: t.n, gridSpacing: gridSpacing,
+               tile: { r: t.r, c: t.c, label: 'r' + (t.r + 1) + 'c' + (t.c + 1) } };
+    });
+
+    // keep world COPIES before the originals are transferred to workers,
+    // so the tuning sliders can re-mesh without re-fetching
+    lastBuild = {
+      tiled: true, layout: layout, model: model, xRangeMerc: spec.xRangeMerc,
+      shared: {
+        zMin: zminG, zMax: zmaxG,
+        autoMinZ: model.min_z_val === null || model.min_z_val === undefined,
+        distortion: shared.distortion,
+        exponent: model.distortion_exponent
+      },
+      resolution: resolution, zoom: zoomUsed,
+      tiles: tiles.map(function (t) {
+        return { model: t.model, world: t.world.slice(), m: t.m, n: t.n,
+                 gridSpacing: t.gridSpacing, tile: t.tile };
+      })
+    };
+
+    return buildTilesThroughWorkers(tiles, function (i) {
+      $('building-label').textContent = 'Building tile ' + (i + 1) + '/' + N + '…';
+      setProgress(0.55 + 0.45 * i / N);
+    }).then(function (ds) {
+      ds.forEach(function (d) { d.resolution = resolution; d.zoom = zoomUsed; });
+      setBuilding(false);
+      showPreviewTiled(ds, layout);
+    });
+  }).catch(function (err) {
+    setBuilding(false);
+    showError(err.message + '\n(Tiled build failed — check your connection and try again.)');
+  });
+}
+
+// slider re-mesh for a tiled build: recompute the shared z parameters from
+// the stored global extremes, apply them to every tile, rebuild all tiles
+function remeshTiled(fields) {
+  var lb = lastBuild;
+  if (fields.output_z_distortion !== undefined)
+    lb.shared.distortion = fields.output_z_distortion;
+  if (fields.distortion_exponent !== undefined)
+    lb.shared.exponent = fields.distortion_exponent;
+  var shared;
+  try {
+    shared = TopoTiling.sharedZParams({
+      totalWidthM: lb.model.output_x_meters, xRangeMerc: lb.xRangeMerc,
+      zMin: lb.shared.zMin, zMax: lb.shared.zMax,
+      topThickness: lb.model.top_thickness,
+      outputZDistortion: lb.shared.distortion,
+      userMinZ: lb.shared.autoMinZ ? null : lb.model.min_z_val,
+      userDnMin: lb.model.distortion_normalization_min,
+      userDnMax: lb.model.distortion_normalization_max,
+      exponent: lb.shared.exponent
+    });
+  } catch (e) { showError('Re-mesh failed: ' + e.message); return; }
+
+  var tiles = lb.tiles.map(function (t) {
+    var tm = {};
+    for (var k in t.model) tm[k] = t.model[k];
+    delete tm.output_z_meters;
+    tm.output_z_distortion = shared.distortion;
+    tm.min_z_val = shared.minZVal;
+    if (lb.shared.exponent !== undefined && lb.shared.exponent !== null) {
+      tm.distortion_exponent = lb.shared.exponent;
+      tm.distortion_normalization_min = shared.dnMin;
+      tm.distortion_normalization_max = shared.dnMax;
+    } else {
+      delete tm.distortion_exponent;
+      delete tm.distortion_normalization_min;
+      delete tm.distortion_normalization_max;
+    }
+    t.model = tm;
+    return { model: tm, world: t.world.slice(), m: t.m, n: t.n,
+             gridSpacing: t.gridSpacing, tile: t.tile };
+  });
+
+  updateShareURL();
+  $('preview-summary').textContent = 're-meshing…';
+  setTuneBusy(true);
+  buildTilesThroughWorkers(tiles).then(function (ds) {
+    ds.forEach(function (d) { d.resolution = lb.resolution; d.zoom = lb.zoom; });
+    showPreviewTiled(ds, lb.layout, true);   // true: keep the camera pose
+  }).catch(function (err) {
+    setTuneBusy(false);
+    showError('Re-mesh failed: ' + err.message);
   });
 }
 
@@ -757,15 +1093,16 @@ function bboxKey(model) {
   return [model.north, model.south, model.east, model.west].join('|');
 }
 
-function drapePreview(texCanvas) {
+function drapeMeshAt(i, texCanvas) {
   if (!viewerState || !viewerState.THREE) return false;
   var THREE = viewerState.THREE;
   if (typeof THREE.CanvasTexture !== 'function') return false;
+  var m = viewerState.mats && viewerState.mats[i];
+  if (!m) return false;
   try {
     var tex = new THREE.CanvasTexture(texCanvas);
     if (THREE.SRGBColorSpace !== undefined) tex.colorSpace = THREE.SRGBColorSpace;
     tex.anisotropy = 4;
-    var m = viewerState.mat;
     if (m.map && m.map.dispose) m.map.dispose();
     m.map = tex;
     if (m.color && m.color.set) m.color.set(0xffffff);
@@ -773,6 +1110,7 @@ function drapePreview(texCanvas) {
     return true;
   } catch (e) { return false; }
 }
+function drapePreview(texCanvas) { return drapeMeshAt(0, texCanvas); }
 
 // ---- color flow state --------------------------------------------------
 // The satellite texture is a function of (bbox, pad fraction) only, so it
@@ -780,8 +1118,11 @@ function drapePreview(texCanvas) {
 // The color zip additionally depends on the mesh, so it is built lazily on
 // the first download click after each build and cached until the next one.
 var lastPreview = null;
-var texCache = null;    // { key, canvas, blob }
+var texCache = new Map();   // texKey -> { canvas, blob } (multi-entry: tiled
+                            // builds need one texture per tile)
 var colorZip = null;    // { url, name } — null means (re)build on click
+var tileZip = null;     // { url, name } — tiled STL zip, same lifecycle
+var tileStlUrls = [];   // per-tile STL object URLs (revoked on next preview)
 
 function texKey(model) {
   var padFrac = (model.top_pad_width || 0) / model.output_x_meters;
@@ -790,10 +1131,13 @@ function texKey(model) {
 
 function ensureTexture(model, onProgress) {
   var key = texKey(model);
-  if (texCache && texCache.key === key) return Promise.resolve(texCache);
+  var hit = texCache.get(key);
+  if (hit) return Promise.resolve(hit);
   return stitchSatelliteTexture(model, onProgress).then(function (tex) {
-    texCache = { key: key, canvas: tex.canvas, blob: tex.blob };
-    return texCache;
+    if (texCache.size >= 24) texCache.clear();   // bound memory
+    var entry = { key: key, canvas: tex.canvas, blob: tex.blob };
+    texCache.set(key, entry);
+    return entry;
   });
 }
 
@@ -803,11 +1147,11 @@ function triggerDownload(url, name) {
   document.body.appendChild(a); a.click(); a.remove();
 }
 
-// Build <name>_color.zip = flat [<name>.x3d, <name>_texture.jpg], per
+// Build <base>_color.zip = flat [<base>.x3d, <base>_texture.jpg], per
 // Shapeways' color-upload rules. The worker hands back vertices in
 // millimeters; the X3D is written in meters like the original uploads.
-function buildColorZip(d, tex) {
-  var base = (d.model.name || 'toporama').replace(/[^a-z0-9]+/gi, '_');
+// Returns the zip BYTES so tiled builds can nest one zip per tile.
+function buildColorZipBytes(d, tex, base) {
   var texName = base + '_texture.jpg';
   var pos = new Float32Array(d.positions);
   var verts = new Float64Array(pos.length);
@@ -820,11 +1164,82 @@ function buildColorZip(d, tex) {
       { name: texName, data: new Uint8Array(texBuf) }
     ]);
   }).then(function (zip) {
-    var blob = new Blob([zip], { type: 'application/zip' });
-    if (blob.size > 64 * 1024 * 1024)
-      toast('warning: ' + (blob.size / 1e6).toFixed(0) +
+    if (zip.length > 64 * 1024 * 1024)
+      toast('warning: ' + (zip.length / 1e6).toFixed(0) +
         ' MB zip exceeds the 64 MB upload cap — reduce grid points');
+    return zip;
+  });
+}
+function buildColorZip(d, tex) {
+  var base = (d.model.name || 'toporama').replace(/[^a-z0-9]+/gi, '_');
+  return buildColorZipBytes(d, tex, base).then(function (zip) {
+    var blob = new Blob([zip], { type: 'application/zip' });
     return { url: URL.createObjectURL(blob), name: base + '_color.zip' };
+  });
+}
+
+// ---- tiled downloads ----------------------------------------------------
+function layoutManifest(ds, layout, base) {
+  var lines = [
+    'toporama tiled model: ' + (lastBuild.model.name || 'toporama'),
+    layout.cols + ' across x ' + layout.rows + ' down = ' + ds.length + ' tiles',
+    'assembled size: ' + (lastBuild.model.output_x_meters * 100).toFixed(1) +
+      ' x ' + (layout.totalDepthM * 100).toFixed(1) + ' cm',
+    'tile size: up to ' + (layout.tileWidthM * 100).toFixed(1) +
+      ' x ' + (layout.tileDepthM * 100).toFixed(1) + ' cm',
+    '',
+    'map view (north at top, ' + base + '_r1c1 = north-west corner):', ''
+  ];
+  for (var r = 0; r < layout.rows; r++) {
+    var row = '  ';
+    for (var c = 0; c < layout.cols; c++)
+      row += '[r' + (r + 1) + 'c' + (c + 1) + '] ';
+    lines.push(row);
+  }
+  lines.push('');
+  lines.push('All tiles share one base height and one scale: print every');
+  lines.push('tile in the same material and settings, and the edges mate');
+  lines.push('without trimming.');
+  return lines.join('\n');
+}
+
+// <base>_tiles.zip: one STL per tile + a plain-text assembly map
+function buildTileStlZip(lp) {
+  var base = (lastBuild.model.name || 'toporama').replace(/[^a-z0-9]+/gi, '_');
+  var entries = lp.tiles.map(function (d) {
+    return { name: base + '_' + d.tile.label + '.stl', data: new Uint8Array(d.stl) };
+  });
+  entries.push({ name: base + '_layout.txt',
+    data: new TextEncoder().encode(layoutManifest(lp.tiles, lp.layout, base)) });
+  return Topo.makeZip(entries).then(function (zip) {
+    var blob = new Blob([zip], { type: 'application/zip' });
+    return { url: URL.createObjectURL(blob), name: base + '_tiles.zip' };
+  });
+}
+
+// with the satellite overlay on: one Shapeways-uploadable color zip per
+// tile (X3D + texture), nested in a single outer download
+function buildTileColorZip(lp, onStatus) {
+  var base = (lastBuild.model.name || 'toporama').replace(/[^a-z0-9]+/gi, '_');
+  var entries = [];
+  var chain = Promise.resolve();
+  lp.tiles.forEach(function (d, i) {
+    chain = chain.then(function () {
+      if (onStatus) onStatus('tile ' + (i + 1) + '/' + lp.tiles.length + '…');
+      return ensureTexture(d.model).then(function (tex) {
+        return buildColorZipBytes(d, tex, base + '_' + d.tile.label);
+      }).then(function (zip) {
+        entries.push({ name: base + '_' + d.tile.label + '_color.zip', data: zip });
+      });
+    });
+  });
+  return chain.then(function () {
+    entries.push({ name: base + '_layout.txt',
+      data: new TextEncoder().encode(layoutManifest(lp.tiles, lp.layout, base)) });
+    // inner zips are already deflated — store them as-is
+    var outer = Topo.makeStoredZip(entries);
+    var blob = new Blob([outer], { type: 'application/zip' });
+    return { url: URL.createObjectURL(blob), name: base + '_tiles_color.zip' };
   });
 }
 
@@ -833,7 +1248,32 @@ function buildColorZip(d, tex) {
 // color zip instead (built on first click, cached until the next build).
 function onDownloadClick(e) {
   var d = lastPreview;
-  if (!d || !d.model.overlay) return;   // default: the STL href
+  if (!d) return;
+  if (d.tiled) {
+    // tiled: the button always delivers a zip (STLs, or color zips with
+    // the overlay on), built on first click and cached until the next build
+    e.preventDefault();
+    var dlt = $('download');
+    if (dlt.classList.contains('busy')) return;
+    if (tileZip) { triggerDownload(tileZip.url, tileZip.name); return; }
+    dlt.classList.add('busy');
+    var restoreT = dlt.textContent;
+    dlt.textContent = 'packing tiles…';
+    var job = lastBuild.model.overlay
+      ? buildTileColorZip(d, function (msg) { dlt.textContent = msg; })
+      : buildTileStlZip(d);
+    job.then(function (zip) {
+      tileZip = zip;
+      triggerDownload(zip.url, zip.name);
+    }).catch(function (err) {
+      toast('download failed: ' + (err && err.message || err));
+    }).then(function () {
+      dlt.classList.remove('busy');
+      dlt.textContent = restoreT;
+    });
+    return;
+  }
+  if (!d.model.overlay) return;   // default: the STL href
   e.preventDefault();
   var dl = $('download');
   if (dl.classList.contains('busy')) return;
@@ -867,22 +1307,39 @@ var viewerState = null;
 // each triangle as a facet (shows the exact mesh, boosts contrast),
 // 'wire' draws the triangle edges. The light angles give raking light —
 // a low sun makes subtle relief pop, hillshade-style.
-var viewPrefs = { shade: 'smooth', az: 45, alt: 60 };
+var viewPrefs = { shade: 'smooth', az: 45, alt: 60, exploded: false };
 
 function applyViewPrefs() {
-  if (!viewerState || !viewerState.mat) return;
-  var m = viewerState.mat;
-  m.flatShading = viewPrefs.shade !== 'smooth';
-  m.wireframe = viewPrefs.shade === 'wire';
-  m.needsUpdate = true;
+  if (!viewerState || !viewerState.mats) return;
+  viewerState.mats.forEach(function (m) {
+    m.flatShading = viewPrefs.shade !== 'smooth';
+    m.wireframe = viewPrefs.shade === 'wire';
+    m.needsUpdate = true;
+  });
   var az = viewPrefs.az * Math.PI / 180, alt = viewPrefs.alt * Math.PI / 180;
   viewerState.key.position.set(
     Math.cos(az) * Math.cos(alt), Math.sin(az) * Math.cos(alt), Math.sin(alt));
+}
+
+// exploded view: shift each tile away from the assembly center by its
+// stored offset so the individual printed pieces are visible
+function applyExplode() {
+  if (!viewerState || !viewerState.meshes) return;
+  viewerState.meshes.forEach(function (msh) {
+    var e = (viewPrefs.exploded && msh._explode) ? msh._explode : { dx: 0, dy: 0 };
+    if (!msh._basePos) return;
+    msh.position.x = msh._basePos.x + e.dx;
+    msh.position.y = msh._basePos.y + e.dy;
+  });
 }
 function showPreview(d, preserveView) {
   lastPreview = d;   // kept for the color (X3D + texture) download
   // the mesh changed, so any previously built color zip is stale
   if (colorZip) { URL.revokeObjectURL(colorZip.url); colorZip = null; }
+  if (tileZip) { URL.revokeObjectURL(tileZip.url); tileZip = null; }
+  tileStlUrls.forEach(function (u) { URL.revokeObjectURL(u); });
+  tileStlUrls = [];
+  $('explode-seg').style.display = 'none';
   $('preview-title').textContent = d.model.name;
   $('preview-summary').textContent = 'printability: ' + d.summary;
 
@@ -911,88 +1368,7 @@ function showPreview(d, preserveView) {
   var meta = $('preview-meta');
   meta.innerHTML = '';
 
-  // tuning sliders: instant approximate feedback while dragging (the mesh
-  // is z-scaled in the viewer), exact re-mesh from the cached elevation
-  // grid on release — no tile re-download either way
-  if (lastBuild) {
-    var dist0 = Math.round((d.info && d.info.output_z_distortion ||
-      d.model.output_z_distortion || 2) * 100) / 100;
-    var exp0 = d.model.distortion_exponent || 1;
-    var tune = document.createElement('div');
-    tune.className = 'tune';
-    // slider + tick row; the identity tick (value 1 = untransformed) is
-    // accented and clickable as a one-tap reset.
-    // Tick positions must match the THUMB's center, which travels from
-    // thumbW/2 to (100% - thumbW/2) — not the full track — so plain
-    // percentage lefts drift near the ends (worst at the distortion
-    // slider's identity mark, at 5% of the range). The calc() below maps
-    // the fraction onto the thumb-center span; the thumb width is pinned
-    // to 16px in CSS so this is exact rather than browser-dependent.
-    function sliderHTML(id, label, min, max, step, val, ticks) {
-      var h = '<label>' + label + ' <b id="' + id + '-val">' + val + '</b>' +
-        '<input type="range" id="' + id + '" min="' + min + '" max="' + max +
-        '" step="' + step + '" value="' + val + '"><span class="ticks">';
-      ticks.forEach(function (t) {
-        var frac = (t - min) / (max - min);
-        var pos = 'left:calc(' + frac.toFixed(4) + ' * (100% - 16px) + 8px)';
-        h += t === 1
-          ? '<i class="tick identity" data-for="' + id + '" title="reset to 1 (no transform)" style="' + pos + '"></i>' +
-            '<em class="tick-num identity" data-for="' + id + '" title="reset to 1 (no transform)" style="' + pos + '">1</em>'
-          : '<i class="tick" style="' + pos + '"></i>' +
-            '<em class="tick-num" style="' + pos + '">' + t + '</em>';
-      });
-      return h + '</span></label>';
-    }
-    tune.innerHTML =
-      sliderHTML('tune-dist', 'elevation distortion', 0, 20, 0.1, dist0,
-        [0, 1, 5, 10, 15, 20]) +
-      sliderHTML('tune-exp', 'peak-flattening exponent', 0, 2, 0.05, exp0,
-        [0, 0.5, 1, 1.5, 2]);
-    meta.appendChild(tune);
-    var sd = tune.querySelector('#tune-dist'), se = tune.querySelector('#tune-exp');
-    // identity ticks (dot and its number) reset their slider to 1 and apply
-    // it. preventDefault stops the surrounding <label> from forwarding the
-    // click to the range input, which would swallow the reset.
-    tune.querySelectorAll('.identity[data-for]').forEach(function (t) {
-      t.addEventListener('click', function (e) {
-        e.preventDefault();
-        e.stopPropagation();
-        var input = tune.querySelector('#' + t.getAttribute('data-for'));
-        if (input.disabled) return;
-        input.value = 1;
-        input.dispatchEvent(new Event('input'));
-        input.dispatchEvent(new Event('change'));
-      });
-    });
-    sd.addEventListener('input', function () {
-      $('tune-dist-val').textContent = sd.value;
-      // live approximation: scale the rendered mesh in z (bases/walls
-      // stretch a little too — the release re-mesh makes it exact).
-      // The position compensation keeps the BASE plane pinned while
-      // scaling, matching the fixed-floor convention of renderMesh.
-      if (viewerState && viewerState.mesh && dist0 > 0) {
-        var f = parseFloat(sd.value) / dist0;
-        viewerState.mesh.scale.z = f;
-        viewerState.mesh.position.z = -viewerState.baseMinZ * f;
-      }
-    });
-    sd.addEventListener('change', function () {
-      var v = parseFloat(sd.value);
-      $('elevation_distortion').value = v;      // keep the form in sync
-      $('elevation_distortion').disabled = false;
-      $('model_thickness_cm').value = '';
-      $('model_thickness_cm').disabled = false;
-      remesh({ output_z_distortion: v });
-    });
-    se.addEventListener('input', function () {
-      $('tune-exp-val').textContent = se.value;
-    });
-    se.addEventListener('change', function () {
-      var v = parseFloat(se.value);
-      $('distortion_exponent').value = (v === 1 ? '' : v);
-      remesh({ distortion_exponent: v });
-    });
-  }
+  addTuneSliders(meta, d);
 
   d.checks.forEach(function (c) {
     var row = document.createElement('div'); row.className = 'check';
@@ -1031,7 +1407,232 @@ function showPreview(d, preserveView) {
   });
 }
 
-async function renderMesh(positionsBuf, indicesBuf, preserveView) {
+// tuning sliders: instant approximate feedback while dragging (the meshes
+// are z-scaled in the viewer), exact re-mesh from the cached elevation
+// grid on release — no tile re-download either way. Shared by the untiled
+// and tiled preview paths (d is the build result the initial values are
+// read from — for tiled builds, any tile: the z settings are shared).
+function addTuneSliders(meta, d) {
+  if (!lastBuild) return;
+  var dist0 = Math.round((d.info && d.info.output_z_distortion ||
+    d.model.output_z_distortion || 2) * 100) / 100;
+  var exp0 = d.model.distortion_exponent || 1;
+  var tune = document.createElement('div');
+  tune.className = 'tune';
+  // slider + tick row; the identity tick (value 1 = untransformed) is
+  // accented and clickable as a one-tap reset.
+  // Tick positions must match the THUMB's center, which travels from
+  // thumbW/2 to (100% - thumbW/2) — not the full track — so plain
+  // percentage lefts drift near the ends (worst at the distortion
+  // slider's identity mark, at 5% of the range). The calc() below maps
+  // the fraction onto the thumb-center span; the thumb width is pinned
+  // to 16px in CSS so this is exact rather than browser-dependent.
+  function sliderHTML(id, label, min, max, step, val, ticks) {
+    var h = '<label>' + label + ' <b id="' + id + '-val">' + val + '</b>' +
+      '<input type="range" id="' + id + '" min="' + min + '" max="' + max +
+      '" step="' + step + '" value="' + val + '"><span class="ticks">';
+    ticks.forEach(function (t) {
+      var frac = (t - min) / (max - min);
+      var pos = 'left:calc(' + frac.toFixed(4) + ' * (100% - 16px) + 8px)';
+      h += t === 1
+        ? '<i class="tick identity" data-for="' + id + '" title="reset to 1 (no transform)" style="' + pos + '"></i>' +
+          '<em class="tick-num identity" data-for="' + id + '" title="reset to 1 (no transform)" style="' + pos + '">1</em>'
+        : '<i class="tick" style="' + pos + '"></i>' +
+          '<em class="tick-num" style="' + pos + '">' + t + '</em>';
+    });
+    return h + '</span></label>';
+  }
+  tune.innerHTML =
+    sliderHTML('tune-dist', 'elevation distortion', 0, 20, 0.1, dist0,
+      [0, 1, 5, 10, 15, 20]) +
+    sliderHTML('tune-exp', 'peak-flattening exponent', 0, 2, 0.05, exp0,
+      [0, 0.5, 1, 1.5, 2]);
+  meta.appendChild(tune);
+  var sd = tune.querySelector('#tune-dist'), se = tune.querySelector('#tune-exp');
+  // identity ticks (dot and its number) reset their slider to 1 and apply
+  // it. preventDefault stops the surrounding <label> from forwarding the
+  // click to the range input, which would swallow the reset.
+  tune.querySelectorAll('.identity[data-for]').forEach(function (t) {
+    t.addEventListener('click', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      var input = tune.querySelector('#' + t.getAttribute('data-for'));
+      if (input.disabled) return;
+      input.value = 1;
+      input.dispatchEvent(new Event('input'));
+      input.dispatchEvent(new Event('change'));
+    });
+  });
+  sd.addEventListener('input', function () {
+    $('tune-dist-val').textContent = sd.value;
+    // live approximation: scale the rendered mesh(es) in z (bases/walls
+    // stretch a little too — the release re-mesh makes it exact).
+    // The position compensation keeps the BASE plane pinned while
+    // scaling, matching the fixed-floor convention of renderMeshes.
+    if (viewerState && viewerState.meshes && dist0 > 0) {
+      var f = parseFloat(sd.value) / dist0;
+      viewerState.meshes.forEach(function (msh) {
+        msh.scale.z = f;
+        msh.position.z = -viewerState.baseMinZ * f;
+      });
+    }
+  });
+  sd.addEventListener('change', function () {
+    var v = parseFloat(sd.value);
+    $('elevation_distortion').value = v;      // keep the form in sync
+    $('elevation_distortion').disabled = false;
+    $('model_thickness_cm').value = '';
+    $('model_thickness_cm').disabled = false;
+    remesh({ output_z_distortion: v });
+  });
+  se.addEventListener('input', function () {
+    $('tune-exp-val').textContent = se.value;
+  });
+  se.addEventListener('change', function () {
+    var v = parseFloat(se.value);
+    $('distortion_exponent').value = (v === 1 ? '' : v);
+    remesh({ distortion_exponent: v });
+  });
+}
+
+// checkerboard tints so adjacent tiles read as distinct pieces; with the
+// satellite drape the material color multiplies the texture, so use white
+// vs. a slight dim instead of the tan pair
+var TILE_TINTS = { matte: [0xd9c9a8, 0xc7b28b], draped: [0xffffff, 0xdcdcdc] };
+
+// preview for a tiled build: all tiles rendered together (they share one
+// coordinate frame), checkerboard-tinted, with an exploded-view toggle and
+// per-tile downloads
+function showPreviewTiled(ds, layout, preserveView) {
+  // order results by (row, col) so labels, tints and downloads line up
+  ds = ds.slice().sort(function (a, b) {
+    return (a.tile.r - b.tile.r) || (a.tile.c - b.tile.c);
+  });
+  lastPreview = { tiled: true, tiles: ds, layout: layout };
+  if (colorZip) { URL.revokeObjectURL(colorZip.url); colorZip = null; }
+  if (tileZip) { URL.revokeObjectURL(tileZip.url); tileZip = null; }
+  tileStlUrls.forEach(function (u) { URL.revokeObjectURL(u); });
+  tileStlUrls = [];
+
+  var base = (lastBuild.model.name || 'toporama').replace(/[^a-z0-9]+/gi, '_');
+  $('preview-title').textContent = lastBuild.model.name +
+    ' (' + layout.cols + '×' + layout.rows + ' tiles)';
+  var worst = 'PASS';
+  ds.forEach(function (d) {
+    if (d.summary === 'FAIL') worst = 'FAIL';
+    else if (d.summary === 'WARN' && worst !== 'FAIL') worst = 'WARN';
+  });
+  $('preview-summary').textContent = 'printability: ' + worst +
+    ' (' + ds.length + ' tiles)';
+
+  var overlay = !!lastBuild.model.overlay;
+  var dl = $('download');
+  dl.href = '#';
+  dl.textContent = overlay ? 'Download color zips (' + ds.length + ' tiles)'
+                           : 'Download STLs (' + ds.length + ' tiles)';
+
+  var meta = $('preview-meta');
+  meta.innerHTML = '';
+  addTuneSliders(meta, ds[0]);
+
+  // per-tile roll-up: one row per tile with its verdict, size, and STL
+  var tbl = document.createElement('div');
+  ds.forEach(function (d) {
+    var url = URL.createObjectURL(new Blob([d.stl], { type: 'model/stl' }));
+    tileStlUrls.push(url);
+    var row = document.createElement('div'); row.className = 'check';
+    var lv = document.createElement('span');
+    lv.className = 'level ' + d.summary; lv.textContent = d.summary;
+    var nm = document.createElement('span'); nm.className = 'name';
+    nm.textContent = 'tile ' + d.tile.label;
+    var ms = document.createElement('span');
+    ms.textContent = d.size_mm.map(function (x) { return x.toFixed(0); }).join(' × ') +
+      ' mm · ' + d.num_faces.toLocaleString() + ' tris · ';
+    var a = document.createElement('a');
+    a.href = url; a.download = base + '_' + d.tile.label + '.stl';
+    a.textContent = 'STL';
+    ms.appendChild(a);
+    row.appendChild(lv); row.appendChild(nm); row.appendChild(ms);
+    tbl.appendChild(row);
+    // full checks for tiles that aren't clean, collapsed by default
+    if (d.summary !== 'PASS') {
+      var det = document.createElement('details');
+      var sum = document.createElement('summary');
+      sum.textContent = 'checks for tile ' + d.tile.label;
+      det.appendChild(sum);
+      d.checks.forEach(function (c) {
+        var r2 = document.createElement('div'); r2.className = 'check';
+        var l2 = document.createElement('span'); l2.className = 'level ' + c.level; l2.textContent = c.level;
+        var n2 = document.createElement('span'); n2.className = 'name'; n2.textContent = c.check.replace(/_/g, ' ');
+        var m2 = document.createElement('span'); m2.textContent = c.message;
+        r2.appendChild(l2); r2.appendChild(n2); r2.appendChild(m2); det.appendChild(r2);
+      });
+      tbl.appendChild(det);
+    }
+  });
+  meta.appendChild(tbl);
+
+  var d0 = ds[0];
+  var dl2 = document.createElement('dl');
+  function add(k, v) { var dt = document.createElement('dt'); dt.textContent = k; var dd = document.createElement('dd'); dd.textContent = v; dl2.appendChild(dt); dl2.appendChild(dd); }
+  add('tiles', layout.cols + ' across × ' + layout.rows + ' down = ' + ds.length);
+  add('assembled size (cm)', (lastBuild.model.output_x_meters * 100).toFixed(1) +
+    ' × ' + (layout.totalDepthM * 100).toFixed(1));
+  add('tile size (cm)', '≤ ' + (layout.tileWidthM * 100).toFixed(1) +
+    ' × ' + (layout.tileDepthM * 100).toFixed(1));
+  add('triangles (total)', ds.reduce(function (s, d) { return s + d.num_faces; }, 0).toLocaleString());
+  add('grid spacing (m)', d0.grid_spacing_m.toFixed(1));
+  if (d0.resolution) add('data resolution (m)', '~' + d0.resolution.median +
+    (d0.zoom ? ' (zoom ' + d0.zoom + ')' : ' (Google)'));
+  if (d0.resolution && d0.resolution.median > 2 * d0.grid_spacing_m)
+    add('note', 'terrain tiles are coarser than the grid here — extra points cannot add detail');
+  meta.appendChild(dl2);
+
+  $('preview-panel').style.display = 'flex';
+  document.body.classList.add('previewing');
+  closeSidebar();
+  $('explode-seg').style.display = '';
+
+  // exploded-view offsets: push each tile away from the grid center by a
+  // gap proportional to the tile size (a fixed visual separation)
+  var gap = Math.max(5, 0.06 * Math.max(layout.tileWidthM, layout.tileDepthM) * 1000);
+  var tints = overlay ? TILE_TINTS.draped : TILE_TINTS.matte;
+  var items = ds.map(function (d) {
+    return {
+      positions: d.positions, indices: d.indices,
+      color: tints[(d.tile.r + d.tile.c) % 2],
+      explode: {
+        dx: (d.tile.c - (layout.cols - 1) / 2) * gap,
+        dy: ((layout.rows - 1) / 2 - d.tile.r) * gap
+      }
+    };
+  });
+  renderMeshes(items, preserveView).then(function () {
+    setTuneBusy(false);
+    if (overlay) {
+      // one texture per tile, draped with the same planar UVs the color
+      // export uses (cache hits make re-meshes instant)
+      ds.forEach(function (d, i) {
+        ensureTexture(d.model).then(function (t) {
+          drapeMeshAt(i, t.canvas);
+        }).catch(function (err) {
+          toast('satellite imagery failed: ' + (err && err.message || err));
+        });
+      });
+    }
+  }).catch(function (err) {
+    setTuneBusy(false);
+    $('preview-meta').insertAdjacentHTML('afterbegin',
+      '<div class="msg info" style="display:block">3D preview unavailable (' +
+      (err && err.message ? err.message : err) + '). Your tile STLs are ready ' +
+      'to download above.</div>');
+  });
+}
+
+// Render one or more meshes (an untiled model, or a tiled model's tiles —
+// which share one absolute coordinate frame, so they assemble themselves).
+// items: [{ positions, indices, color?, explode?: {dx, dy} }]
+async function renderMeshes(items, preserveView) {
   var THREE = await import('three');
   var OrbitControls = (await import('three/addons/controls/OrbitControls.js')).OrbitControls;
   var canvas = $('viewer');
@@ -1062,26 +1663,46 @@ async function renderMesh(positionsBuf, indicesBuf, preserveView) {
   var key = new THREE.DirectionalLight(0xffffff, 1.1); key.position.set(1, 1, 2); scene.add(key);
   var fill = new THREE.DirectionalLight(0xfff2dd, 0.5); fill.position.set(-1, -0.5, 1); scene.add(fill);
 
-  var geom = new THREE.BufferGeometry();
-  var positions = new Float32Array(positionsBuf);
-  geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  geom.setIndex(new THREE.BufferAttribute(new Uint32Array(indicesBuf), 1));
-  // UVs use the same planar mapping as the color export, so the stitched
-  // satellite texture can be draped here as an on-screen print preview
-  geom.setAttribute('uv', new THREE.BufferAttribute(Topo.computeUVs(positions), 2));
-  geom.computeVertexNormals();
-  geom.computeBoundingBox();
-  var size = new THREE.Vector3(); geom.boundingBox.getSize(size);
-  var center = new THREE.Vector3(); geom.boundingBox.getCenter(center);
+  // union bounds across all pieces, computed from the raw arrays (tiles
+  // must be centered as a GROUP or they would overlap at the origin)
+  var minx = Infinity, miny = Infinity, minz = Infinity;
+  var maxx = -Infinity, maxy = -Infinity, maxz = -Infinity;
+  var meshes = [], mats = [];
+  items.forEach(function (it) {
+    var geom = new THREE.BufferGeometry();
+    var positions = new Float32Array(it.positions);
+    geom.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geom.setIndex(new THREE.BufferAttribute(new Uint32Array(it.indices), 1));
+    // UVs use the same planar mapping as the color export, so the stitched
+    // satellite texture can be draped here as an on-screen print preview
+    geom.setAttribute('uv', new THREE.BufferAttribute(Topo.computeUVs(positions), 2));
+    geom.computeVertexNormals();
+    for (var i = 0; i < positions.length; i += 3) {
+      if (positions[i] < minx) minx = positions[i];
+      if (positions[i] > maxx) maxx = positions[i];
+      if (positions[i + 1] < miny) miny = positions[i + 1];
+      if (positions[i + 1] > maxy) maxy = positions[i + 1];
+      if (positions[i + 2] < minz) minz = positions[i + 2];
+      if (positions[i + 2] > maxz) maxz = positions[i + 2];
+    }
+    var mat = new THREE.MeshStandardMaterial({
+      color: it.color || 0xd9c9a8, metalness: 0.05, roughness: 0.85 });
+    var mesh = new THREE.Mesh(geom, mat);
+    mesh._explode = it.explode || null;
+    meshes.push(mesh); mats.push(mat);
+    scene.add(mesh);
+  });
 
-  var mat = new THREE.MeshStandardMaterial({ color: 0xd9c9a8, metalness: 0.05, roughness: 0.85 });
-  var mesh = new THREE.Mesh(geom, mat);
+  var size = { x: maxx - minx, y: maxy - miny, z: maxz - minz };
+  var cx = minx + size.x / 2, cy = miny + size.y / 2;
   // anchor the BASE plane at world z=0 (x/y centered): models of different
   // heights (e.g. slider re-meshes) then share a fixed floor, so a
   // preserved camera really compares them from the same viewpoint
   // relative to the table the model "stands on"
-  mesh.position.set(-center.x, -center.y, -geom.boundingBox.min.z);
-  scene.add(mesh);
+  meshes.forEach(function (mesh) {
+    mesh._basePos = { x: -cx, y: -cy, z: -minz };
+    mesh.position.set(-cx, -cy, -minz);
+  });
 
   var radius = Math.max(size.x, size.y, size.z);
   camera.position.set(0, -radius * 1.3, radius * 0.9 + size.z / 2);
@@ -1105,12 +1726,18 @@ async function renderMesh(positionsBuf, indicesBuf, preserveView) {
     controls.update();
     renderer.render(scene, camera);
   }
-  viewerState = { renderer: renderer, raf: 0, mesh: mesh,
+  viewerState = { renderer: renderer, raf: 0,
+                  meshes: meshes, mesh: meshes[0],
                   camera: camera, controls: controls,
-                  baseMinZ: geom.boundingBox.min.z,
-                  mat: mat, key: key, THREE: THREE };
+                  baseMinZ: minz,
+                  mats: mats, mat: mats[0], key: key, THREE: THREE };
   applyViewPrefs();
+  applyExplode();
   animate();
+}
+
+function renderMesh(positionsBuf, indicesBuf, preserveView) {
+  return renderMeshes([{ positions: positionsBuf, indices: indicesBuf }], preserveView);
 }
 
 // ---- wire up ----------------------------------------------------------
@@ -1151,6 +1778,18 @@ document.addEventListener('DOMContentLoaded', function () {
   $('sidebar-scrim').addEventListener('click', closeSidebar);
   makeMutex('model_thickness_cm', 'elevation_distortion');
   makeMutex('elevation_distortion', 'model_thickness_cm');
+  // tiling: show/hide the tile-size fields, keep the seam overlay and
+  // summary live as the box, size, or tile settings change
+  $('tiled').addEventListener('change', applyTiledUI);
+  ['tile_max_w_cm', 'tile_max_d_cm', 'tile_rows', 'tile_cols'].forEach(function (id) {
+    $(id).addEventListener('input', updateTileOverlay);
+  });
+  applyTiledUI();
+  $('explode-btn').addEventListener('click', function () {
+    viewPrefs.exploded = !viewPrefs.exploded;
+    $('explode-btn').classList.toggle('on', viewPrefs.exploded);
+    applyExplode();
+  });
   $('model_width_cm').addEventListener('input', function () { updateHeight(); maybeEnableBuild(); });
   $('model_height_cm').addEventListener('change', function () { updateWidth(); maybeEnableBuild(); });
   $('build-form').addEventListener('submit', function (e) {

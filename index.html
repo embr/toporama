@@ -305,6 +305,27 @@
         <div class="hint">drapes aerial imagery over the model — the preview shows it, and the
           download becomes a color X3D&nbsp;+&nbsp;texture zip for Shapeways' full-color materials</div>
       </fieldset>
+      <fieldset>
+        <legend>Tiling</legend>
+        <label><input type="checkbox" id="tiled"> Tile into multiple prints</label>
+        <div class="hint">splits a large model into pieces that each fit your printer,
+          built to assemble seamlessly</div>
+        <div id="tile-opts" style="display:none">
+          <div class="row" style="margin-top:8px">
+            <div class="field">
+              <label for="tile_max_w_cm">Max tile width (cm)</label>
+              <input type="number" id="tile_max_w_cm" step="any" min="1" value="20">
+            </div>
+            <div class="field">
+              <label for="tile_max_d_cm">Max tile depth (cm)</label>
+              <input type="number" id="tile_max_d_cm" step="any" min="1" value="20">
+            </div>
+          </div>
+          <div class="hint">the largest piece your printer/service can make &mdash; e.g.
+            Shapeways clear resin 75&times;75, nylon 66&times;55</div>
+          <div id="tile-summary" class="hint" style="font-weight:600"></div>
+        </div>
+      </fieldset>
 
       <details>
         <summary>Advanced options</summary>
@@ -392,12 +413,23 @@
         </fieldset>
 
         <fieldset>
-          <legend>Tiling</legend>
-          <label><input type="checkbox" id="tiled"> Tiled (no edge padding)</label>
+          <legend>Tiling overrides</legend>
+          <div class="row">
+            <div class="field">
+              <label for="tile_cols">Tiles across</label>
+              <input type="number" id="tile_cols" step="1" min="1" placeholder="auto">
+            </div>
+            <div class="field">
+              <label for="tile_rows">Tiles down</label>
+              <input type="number" id="tile_rows" step="1" min="1" placeholder="auto">
+            </div>
+          </div>
+          <div class="hint">force the tile grid instead of the automatic fit (blank = auto)</div>
           <div class="field" style="margin-top:8px">
             <label for="min_z_val">Min z value (model meters)</label>
             <input type="number" id="min_z_val" step="any">
-            <div class="hint">set the same value on every tile so multiple tiled solids share one base height</div>
+            <div class="hint">auto-computed for tiled builds; set manually only to match tiles
+              from a separate build</div>
           </div>
           <div class="row">
             <div class="field">
@@ -409,7 +441,7 @@
               <input type="number" id="dn_max" step="any">
             </div>
           </div>
-          <div class="hint">normalization pins the distortion range so separate tiles distort identically</div>
+          <div class="hint">distortion normalization pins &mdash; auto-computed for tiled builds</div>
         </fieldset>
       </details>
 
@@ -448,6 +480,9 @@
           <button type="button" data-shade="flat">flat</button>
           <button type="button" data-shade="wire">wire</button>
         </div>
+        <div class="seg" id="explode-seg" style="display:none">
+          <button type="button" id="explode-btn">exploded</button>
+        </div>
         <label>light direction <input type="range" id="light-az" min="0" max="360" step="5" value="45"></label>
         <label>light height <input type="range" id="light-alt" min="10" max="80" step="5" value="60"></label>
       </div>
@@ -462,9 +497,10 @@
         "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
     } }
   </script>
-  <script src="topocore.js?v=34"></script>
-  <script src="elevation.js?v=34"></script>
-  <script src="elevation-google.js?v=34"></script>
-  <script type="module" src="app.js?v=34"></script>
+  <script src="topocore.js?v=35"></script>
+  <script src="tiling.js?v=35"></script>
+  <script src="elevation.js?v=35"></script>
+  <script src="elevation-google.js?v=35"></script>
+  <script type="module" src="app.js?v=35"></script>
 </body>
 </html>
