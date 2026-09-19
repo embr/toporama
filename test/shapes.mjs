@@ -117,6 +117,27 @@ function rimWidths(shape, fr, grid, cells, wall) {
   return out;
 }
 
+// Areas of the cells touching the wall band, relative to an untouched
+// grid cell — how much the band placement distorted the mesh around it.
+function bandCellAreas(grid, cells, wall) {
+  const { m, n, uv, cellU, cellV } = grid, cw = n - 1;
+  const nominal = cellU * cellV, out = [];
+  for (let r = 0; r < m - 1; r++)
+    for (let c = 0; c < cw; c++) {
+      if (!cells[r * cw + c]) continue;
+      const idx = [[r, c], [r, c + 1], [r + 1, c + 1], [r + 1, c]];
+      if (!idx.some(([rr, cc]) => wall[rr * n + cc])) continue;
+      let a = 0;
+      for (let k = 0; k < 4; k++) {
+        const [r1, c1] = idx[k], [r2, c2] = idx[(k + 1) % 4];
+        const p = (r1 * n + c1) * 2, q = (r2 * n + c2) * 2;
+        a += uv[p] * uv[q + 1] - uv[q] * uv[p + 1];
+      }
+      out.push(Math.abs(a / 2) / nominal);
+    }
+  return out;
+}
+
 function meshChecks(label, solid) {
   check(label + ': watertight', Topo.isWatertight(solid));
   check(label + ': winding consistent', Topo.isWindingConsistent(solid));
@@ -362,6 +383,22 @@ function lShapeLngLat() {
       widths.length + ' inner-edge vertices');
     check(label + ': corner bulge stays bounded', hi <= 2.0,
       'worst=' + hi.toFixed(2) + ' x wt');
+    // Placing the inner ring squeezes the cells just inside it. If all of
+    // that squeeze lands on one row they collapse into slivers — a full
+    // cell long but a fraction of one across — which show up as stray
+    // extra edges just inside the rim. The relaxation shares it outward.
+    const areas = bandCellAreas(res.grid, res.mask.cells, res.band.wall)
+      .sort((a, b) => a - b);
+    const pinched = areas.filter(a => a < 0.2).length;
+    // Along the edges the relaxation clears them entirely. A handful
+    // survive where a polygon's convex corner makes the two edges' inward
+    // offsets converge, which vertex-snapping cannot open up; they stay
+    // thin but never degenerate. Clipping the grid against the boundary
+    // (rather than moving its vertices) is what removes these for good.
+    check(label + ': pinched cells are rare and never degenerate',
+      pinched <= 2 && areas[0] > 1e-3,
+      'smallest=' + areas[0].toFixed(4) + ' of nominal, ' + pinched +
+      ' under 0.2 of ' + areas.length);
     meshChecks(label + ' with placed band', res.built.solid);
   }
 }

@@ -379,8 +379,9 @@
 
   // Signed areas of the (up to 8) kept triangles touching vertex (r,c)
   // must all stay positive — gridFaces winds cells CCW in the uv plane.
-  function cellsStayValid(uv, m, n, cellKeep, r, c) {
+  function cellsStayValid(uv, m, n, cellKeep, r, c, minCross) {
     var cw = n - 1;
+    var floor = minCross || 0;
     for (var dr = -1; dr <= 0; dr++) {
       for (var dc = -1; dc <= 0; dc++) {
         var rr = r + dr, cc = c + dc;
@@ -390,8 +391,8 @@
         var b = ((rr + 1) * n + cc) * 2;        // v10
         var d = ((rr + 1) * n + cc + 1) * 2;    // v11
         var e = (rr * n + cc + 1) * 2;          // v01
-        if (signedArea(uv, a, b, d) <= 0) return false;
-        if (signedArea(uv, a, d, e) <= 0) return false;
+        if (signedArea(uv, a, b, d) <= floor) return false;
+        if (signedArea(uv, a, d, e) <= floor) return false;
       }
     }
     return true;
@@ -490,6 +491,12 @@
     // for the same reason snapBoundary repeats
     var moved = 0, stuck = 0, pass;
     var tol = 1e-4 * wt;
+    // A minimum-area floor here was tried and reverted: it blocks so many
+    // offset moves near corners that the rim width swings to 3x target,
+    // which is worse than the few pinched cells it prevents. The real cure
+    // is to clip the grid against the boundary instead of moving its
+    // vertices — see the note at the top of the file.
+    var minCross = 0;
     for (pass = 0; pass < SNAP_PASSES; pass++) {
       var changed = 0;
       stuck = 0;
@@ -504,7 +511,7 @@
         var du = tx - u, dv = ty - v, f = 1, ok = false;
         for (var att = 0; att < 7; att++) {
           uv[g * 2] = u + du * f; uv[g * 2 + 1] = v + dv * f;
-          if (cellsStayValid(uv, m, n, cellKeep, (g / n) | 0, g % n)) { ok = true; break; }
+          if (cellsStayValid(uv, m, n, cellKeep, (g / n) | 0, g % n, minCross)) { ok = true; break; }
           f /= 2;
         }
         if (!ok) { uv[g * 2] = u; uv[g * 2 + 1] = v; stuck++; continue; }
@@ -513,8 +520,46 @@
       }
       if (!changed) break;
     }
+    // Placing the inner ring pushes it toward the next ring in, and all of
+    // that compression lands on one row of cells: measured on a circle, 31
+    // of 2372 band cells came out under a fifth of their natural area,
+    // 0.08-0.26 of a cell across while still a full cell along. Those
+    // slivers are what read as stray extra edges just inside the rim. So
+    // give the next ring out a minimum clearance too, which shares the
+    // squeeze between two rows instead of collapsing one.
+    var gap = 0.45 * Math.min(cellU, cellV);
+    var seen = new Uint8Array(N), outside = [];
+    for (i = 0; i < inner.length; i++) {
+      g = inner[i];
+      forEachNeighbor(m, n, (g / n) | 0, g % n, function (h) {
+        if (used[h] && !wall[h] && !seen[h]) { seen[h] = 1; outside.push(h); }
+      });
+    }
+    var relaxed = 0;
+    for (pass = 0; pass < SNAP_PASSES; pass++) {
+      var freed = 0;
+      for (i = 0; i < outside.length; i++) {
+        g = outside[i];
+        var ou = uv[g * 2], ov = uv[g * 2 + 1];
+        var nb3 = near(ou, ov);
+        if (nb3.d >= wt + gap || nb3.d < 1e-12) continue;
+        var ex = (ou - nb3.px) / nb3.d, ey = (ov - nb3.py) / nb3.d;
+        var gx = nb3.px + ex * (wt + gap) - ou;
+        var gy = nb3.py + ey * (wt + gap) - ov;
+        var gf = 1, gok = false;
+        for (var ga = 0; ga < 7; ga++) {
+          uv[g * 2] = ou + gx * gf; uv[g * 2 + 1] = ov + gy * gf;
+          if (cellsStayValid(uv, m, n, cellKeep, (g / n) | 0, g % n, minCross)) { gok = true; break; }
+          gf /= 2;
+        }
+        if (!gok) { uv[g * 2] = ou; uv[g * 2 + 1] = ov; continue; }
+        freed++;
+        if (pass === 0) relaxed++;
+      }
+      if (!freed) break;
+    }
     return { wall: wall, moved: moved, stuck: stuck, ring: inner.length,
-             passes: pass + 1 };
+             relaxed: relaxed, passes: pass + 1 };
   }
 
   // Nearest point on whichever boundary is closer: the shape outline, or a
