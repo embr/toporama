@@ -401,6 +401,204 @@
            (uv[b + 1] - uv[a + 1]) * (uv[c] - uv[a]);
   }
 
+  // ---- wall band ---------------------------------------------------------
+  // The shell's underside is pinned flat to the base plane within
+  // `wt` of the outline, and that flat annulus IS the printed rim. Picking
+  // the band per grid vertex leaves its inner edge on a staircase: measured
+  // on a circle, the rim came out 0.51-1.41 mm wide against a 1.00 mm
+  // target — visibly sawtoothed from inside, and thinner than the material
+  // minimum at the narrow points. No purely per-vertex rule can do better,
+  // because the cliff can only ever land on grid vertices.
+  //
+  // So the ring of vertices forming that inner edge is snapped onto the
+  // exact inward offset of the boundary, the same way the outline itself is
+  // snapped onto the shape. Distance is measured to whichever boundary is
+  // nearer — the shape outline, or the local box edge, which is a real cut
+  // when the piece is one tile of a tiled model and needs its own wall.
+  //
+  // Returns per-grid-vertex wall flags for topocore's makeBottom.
+  function wallBand(s, fr, uv, m, n, cellKeep, wt, localBox, cuts) {
+    var N = m * n, i, r, c, g;
+    var cellU = Math.abs(uv[(0 * n + 1) * 2] - uv[0]);
+    var cellV = Math.abs(uv[(1 * n) * 2 + 1] - uv[1]);
+    var used = new Uint8Array(N), rim = new Uint8Array(N);
+    for (r = 0; r < m; r++) {
+      for (c = 0; c < n; c++) {
+        g = r * n + c;
+        if (!vertexUsed(cellKeep, m, n, r, c)) continue;
+        used[g] = 1;
+        if (onKeptEdge(cellKeep, m, n, r, c)) rim[g] = 1;
+      }
+    }
+    // only vertices within a few rings of a boundary can be in the band
+    var K = Math.ceil(wt / Math.max(1e-12, Math.min(cellU, cellV))) + 2;
+    var cand = ringsFromRim(rim, used, m, n, K);
+
+    // A local box edge is a boundary only where it is a real CUT — a seam
+    // between tiles — and cells actually reach it. `cuts` says which edges
+    // are seams; the caller knows, and guessing from kept cells alone gets
+    // it wrong for an untiled shape that merely touches its bounding box
+    // at a point (a circle, a diamond), where one stray border cell would
+    // otherwise make the whole bbox edge look like a boundary.
+    var cw = n - 1, ch = m - 1, rr, cc;
+    var active = { minU: false, maxU: false, minV: false, maxV: false };
+    if (cuts) {
+      for (rr = 0; rr < ch; rr++) {
+        if (cuts.minU && cellKeep[rr * cw]) active.minU = true;
+        if (cuts.maxU && cellKeep[rr * cw + cw - 1]) active.maxU = true;
+      }
+      for (cc = 0; cc < cw; cc++) {
+        if (cuts.maxV && cellKeep[cc]) active.maxV = true;     // row 0 is max v
+        if (cuts.minV && cellKeep[(ch - 1) * cw + cc]) active.minV = true;
+      }
+    }
+    var near = nearestBoundary(s, fr, localBox, active);
+    var wall = new Uint8Array(N);
+    var dist = new Float64Array(N);
+    for (g = 0; g < N; g++) {
+      if (!cand[g]) continue;
+      if (rim[g]) { wall[g] = 1; dist[g] = 0; continue; }
+      var nb = near(uv[g * 2], uv[g * 2 + 1]);
+      dist[g] = nb.d;
+      if (nb.d <= wt) wall[g] = 1;
+    }
+    // keep the band at least two vertices deep, so there is always a ring
+    // to place the cliff on even when wt is under one cell
+    for (r = 0; r < m; r++) {
+      for (c = 0; c < n; c++) {
+        g = r * n + c;
+        if (!rim[g]) continue;
+        forEachNeighbor(m, n, r, c, function (h) {
+          if (used[h] && !rim[h]) wall[h] = 1;
+        });
+      }
+    }
+    // the ring that carries the inner cliff
+    var inner = [];
+    for (r = 0; r < m; r++) {
+      for (c = 0; c < n; c++) {
+        g = r * n + c;
+        if (!wall[g] || rim[g]) continue;
+        var edge = false;
+        forEachNeighbor(m, n, r, c, function (h) {
+          if (used[h] && !wall[h]) edge = true;
+        });
+        if (edge) inner.push(g);
+      }
+    }
+    // slide each of those onto the exact offset, fold-guarded and repeated
+    // for the same reason snapBoundary repeats
+    var moved = 0, stuck = 0, pass;
+    var tol = 1e-4 * wt;
+    for (pass = 0; pass < SNAP_PASSES; pass++) {
+      var changed = 0;
+      stuck = 0;
+      for (i = 0; i < inner.length; i++) {
+        g = inner[i];
+        var u = uv[g * 2], v = uv[g * 2 + 1];
+        var nb2 = near(u, v);
+        if (Math.abs(nb2.d - wt) <= tol) continue;
+        if (nb2.d < 1e-12) continue;            // sitting on the boundary
+        var dx = (u - nb2.px) / nb2.d, dy = (v - nb2.py) / nb2.d;
+        var tx = nb2.px + dx * wt, ty = nb2.py + dy * wt;
+        var du = tx - u, dv = ty - v, f = 1, ok = false;
+        for (var att = 0; att < 7; att++) {
+          uv[g * 2] = u + du * f; uv[g * 2 + 1] = v + dv * f;
+          if (cellsStayValid(uv, m, n, cellKeep, (g / n) | 0, g % n)) { ok = true; break; }
+          f /= 2;
+        }
+        if (!ok) { uv[g * 2] = u; uv[g * 2 + 1] = v; stuck++; continue; }
+        changed++;
+        if (pass === 0) moved++;
+      }
+      if (!changed) break;
+    }
+    return { wall: wall, moved: moved, stuck: stuck, ring: inner.length,
+             passes: pass + 1 };
+  }
+
+  // Nearest point on whichever boundary is closer: the shape outline, or a
+  // local box edge (a tile cut). Returns {d, px, py} in local coords. The
+  // polygon ring is built once, not per vertex.
+  function nearestBoundary(s, fr, localBox, active) {
+    var ring = (s.kind === 'poly') ? localRing(s, fr) : null;
+    return function (u, v) {
+      var px, py, d;
+      if (s.kind === 'circle') {
+        var rr = Math.sqrt(u * u + v * v);
+        if (rr < 1e-12) { px = s.radius; py = 0; }
+        else { px = u / rr * s.radius; py = v / rr * s.radius; }
+        d = Math.abs(rr - s.radius);
+      } else {
+        var p = ring ? closestOnRing(ring, u, v) : projectToBoundary(s, fr, u, v);
+        px = p[0]; py = p[1];
+        d = Math.sqrt((u - px) * (u - px) + (v - py) * (v - py));
+      }
+      if (localBox && active) {
+        var cands = [];
+        if (active.minU) cands.push([localBox.minU, v]);
+        if (active.maxU) cands.push([localBox.maxU, v]);
+        if (active.minV) cands.push([u, localBox.minV]);
+        if (active.maxV) cands.push([u, localBox.maxV]);
+        for (var i = 0; i < cands.length; i++) {
+          var q = cands[i];
+          var dd = Math.sqrt((u - q[0]) * (u - q[0]) + (v - q[1]) * (v - q[1]));
+          if (dd < d) { d = dd; px = q[0]; py = q[1]; }
+        }
+      }
+      return { d: d, px: px, py: py };
+    };
+  }
+
+  function forEachNeighbor(m, n, r, c, fn) {
+    for (var dr = -1; dr <= 1; dr++)
+      for (var dc = -1; dc <= 1; dc++) {
+        if (!dr && !dc) continue;
+        var rr = r + dr, cc = c + dc;
+        if (rr < 0 || cc < 0 || rr >= m || cc >= n) continue;
+        fn(rr * n + cc);
+      }
+  }
+
+  // Vertices within `depth` 8-connected steps of the rim (or of the grid
+  // border, which is a cut edge on a tile) — the only ones the band can
+  // reach, so the exact distance is computed nowhere else.
+  function ringsFromRim(rim, used, m, n, depth) {
+    var N = m * n, out = new Uint8Array(N), frontier = [], next, i, r, c, g;
+    for (r = 0; r < m; r++) {
+      for (c = 0; c < n; c++) {
+        g = r * n + c;
+        if (!used[g]) continue;
+        if (rim[g] || r === 0 || c === 0 || r === m - 1 || c === n - 1) {
+          out[g] = 1; frontier.push(g);
+        }
+      }
+    }
+    for (var step = 0; step < depth; step++) {
+      next = [];
+      for (i = 0; i < frontier.length; i++) {
+        g = frontier[i];
+        forEachNeighbor(m, n, (g / n) | 0, g % n, function (h) {
+          if (used[h] && !out[h]) { out[h] = 1; next.push(h); }
+        });
+      }
+      if (!next.length) break;
+      frontier = next;
+    }
+    return out;
+  }
+
+  function vertexUsed(cellKeep, m, n, r, c) {
+    var cw = n - 1;
+    for (var dr = -1; dr <= 0; dr++)
+      for (var dc = -1; dc <= 0; dc++) {
+        var rr = r + dr, cc = c + dc;
+        if (rr < 0 || cc < 0 || rr >= m - 1 || cc >= n - 1) continue;
+        if (cellKeep[rr * cw + cc]) return true;
+      }
+    return false;
+  }
+
   // ---- share-link encoding ----------------------------------------------
   // An unrotated rectangle needs nothing: the link's existing n/s/e/w
   // bounds already describe it, so old links keep working and new ones stay
@@ -462,7 +660,7 @@
     outlineLatLng: outlineLatLng, geoBounds: geoBounds,
     containsLngLat: containsLngLat, centerLatLng: centerLatLng,
     gridDims: gridDims, buildGrid: buildGrid, sampleGrid: sampleGrid,
-    cellMask: cellMask, snapBoundary: snapBoundary,
+    cellMask: cellMask, snapBoundary: snapBoundary, wallBand: wallBand,
     encode: encode, decode: decode,
     CIRCLE_SEGMENTS: CIRCLE_SEGMENTS
   };

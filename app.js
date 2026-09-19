@@ -846,9 +846,23 @@ function prepareShapeGrid(model, maxPts, what, fr, localBox) {
     model.cell_keep = mask.cells;
     model.cell_u = grid.cellU;
     model.cell_v = grid.cellV;
+    model.wall_grid = shapeWallBand(model, shape, fr, grid.uv, grid.m, grid.n,
+      mask.cells, localBox || fr);
   }
   grid.mask = mask;
   return grid;
+}
+
+// Place the flat base band and slide its inner ring onto the exact inward
+// offset of the outline. wall_thickness is in model metres, so convert it
+// to the local frame's metres first. Mutates `uv` (the inner ring moves).
+function shapeWallBand(model, shp, fr, uv, m, n, cells, localBox, cuts) {
+  var xyScale = model.output_x_meters / (fr.maxU - fr.minU);
+  var wtLocal = model.wall_thickness / xyScale;
+  var band = TopoShape.wallBand(shp, fr, uv, m, n, cells, wtLocal, localBox, cuts);
+  log('wall band:', { ring: band.ring, moved: band.moved,
+                      stuck: band.stuck, passes: band.passes });
+  return band.wall;
 }
 
 // (x, y, elevation) in the shape's local frame — what the mesh is built on.
@@ -1314,8 +1328,17 @@ function doBuildTiled(model, useGoogle, fetchOpts) {
       if (t.cells) {
         tm.cell_keep = t.cells;
         tm.cell_u = spec.cellU; tm.cell_v = spec.cellV;
+        // per tile, because a tile's seam cuts are boundaries too and need
+        // their own wall; seam vertices are never moved, so tiles still
+        // meet exactly
+        tm.wall_grid = shapeWallBand(tm, shape, fr, t.uv, t.m, t.n,
+          t.cells, t.localBox, {
+            minU: t.c > 0, maxU: t.c < layout.cols - 1,
+            minV: t.r < layout.rows - 1, maxV: t.r > 0
+          });
       } else {
         delete tm.cell_keep;
+        delete tm.wall_grid;
       }
       tm.local_box = t.localBox;     // this tile's own frame box (imagery)
       var elevs = TopoTiling.sliceElevations(spec, globalElevs, t.r, t.c);

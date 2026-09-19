@@ -37,10 +37,16 @@ function buildShaped(shape, maxPts, extra) {
   const fr = Shape.frame(shape);
   const grid = Shape.buildGrid(shape, maxPts, fr);
   const masked = Shape.needsMask(shape);
-  let mask = null, snap = null;
+  const wtModel = (extra && extra.wall_thickness) || 0.001;
+  const outX = (extra && extra.output_x_meters) || 0.3;
+  let mask = null, snap = null, band = null;
   if (masked) {
     mask = Shape.cellMask(shape, fr, grid.uv, grid.m, grid.n);
     snap = Shape.snapBoundary(shape, fr, grid.uv, grid.m, grid.n, mask.cells);
+    const xyScale = outX / (fr.maxU - fr.minU);
+    band = Shape.wallBand(shape, fr, grid.uv, grid.m, grid.n, mask.cells,
+      wtModel / xyScale,
+      { minU: fr.minU, maxU: fr.maxU, minV: fr.minV, maxV: fr.maxV });
   }
   const N = grid.m * grid.n;
   const world = new Float64Array(N * 3);
@@ -71,9 +77,10 @@ function buildShaped(shape, maxPts, extra) {
   if (masked) {
     model.cell_keep = mask.cells;
     model.cell_u = grid.cellU; model.cell_v = grid.cellV;
+    model.wall_grid = band.wall;
   }
   const built = Topo.buildSolid(model, world, grid.m, grid.n);
-  return { built, grid, fr, mask, snap, model };
+  return { built, grid, fr, mask, snap, band, model };
 }
 function vertexUsed(cells, m, n, r, c) {
   const cw = n - 1;
@@ -84,6 +91,30 @@ function vertexUsed(cells, m, n, r, c) {
       if (cells[rr * cw + cc]) return true;
     }
   return false;
+}
+
+// The printed rim is the flat band between the outline and the inner
+// cliff. Measure it where it matters: the exact distance from the outline
+// to each vertex on the band's inner edge.
+function rimWidths(shape, fr, grid, cells, wall) {
+  const { m, n, uv } = grid, cw = n - 1, out = [];
+  const usedAt = (r, c) => vertexUsed(cells, m, n, r, c);
+  for (let r = 0; r < m; r++)
+    for (let c = 0; c < n; c++) {
+      const g = r * n + c;
+      if (!wall[g]) continue;
+      let onEdge = false;
+      for (let dr = -1; dr <= 1; dr++)
+        for (let dc = -1; dc <= 1; dc++) {
+          const rr = r + dr, cc = c + dc;
+          if (rr < 0 || cc < 0 || rr >= m || cc >= n) continue;
+          if (usedAt(rr, cc) && !wall[rr * n + cc]) onEdge = true;
+        }
+      if (!onEdge) continue;
+      const p = Shape.projectToBoundary(shape, fr, uv[g * 2], uv[g * 2 + 1]);
+      out.push(Math.hypot(uv[g * 2] - p[0], uv[g * 2 + 1] - p[1]));
+    }
+  return out;
 }
 
 function meshChecks(label, solid) {
@@ -288,6 +319,53 @@ function lShapeLngLat() {
     'moved=' + movedInterior);
 }
 
+// ---------- the printed rim must be an even width, on any edge angle ----
+// The flat base band's inner edge used to be decided per grid vertex, so
+// it staircased: on a circle the rim measured 0.51-1.41 mm against a 1.00
+// mm target — sawtoothed from underneath, and below the material minimum
+// at the thin points. It shows on anything not parallel to the grid, so a
+// diagonal-edged polygon is checked alongside the circle.
+{
+  const WT = 0.001, OUT_X = 0.3;
+  const cases = [
+    ['circle', Shape.circle(CENTER, 5000), 150],
+    // a diamond: all four edges run at 45 degrees to the sample grid
+    ['diagonal polygon', Shape.poly([[0, 5200], [5200, 0], [0, -5200], [-5200, 0]]
+      .map(p => Shape.localToLngLat(
+        Shape.frame(Shape.rect(CENTER, 1, 1, 0)), p[0], p[1]))), 150],
+    // an irregular outline with both shallow and steep edge angles
+    ['irregular polygon', Shape.poly([[-5000, -4000], [1500, -5200], [5200, 900],
+      [2400, 4800], [-3600, 3900]]
+      .map(p => Shape.localToLngLat(
+        Shape.frame(Shape.rect(CENTER, 1, 1, 0)), p[0], p[1]))), 150],
+    // concave: the inward offset has to survive a notch
+    ['L polygon', Shape.poly(lShapeLngLat()), 150]
+  ];
+  for (const [label, shp, pts] of cases) {
+    const res = buildShaped(shp, pts, { wall_thickness: WT, output_x_meters: OUT_X });
+    const xyScale = OUT_X / (res.fr.maxU - res.fr.minU);
+    const wtLocal = WT / xyScale;
+    const widths = rimWidths(shp, res.fr, res.grid, res.mask.cells, res.band.wall)
+      .map(w => w / wtLocal).sort((a, b) => a - b);
+    const lo = widths[0], hi = widths[widths.length - 1];
+    const p98 = widths[Math.floor(0.98 * (widths.length - 1))];
+    // the safety property: the rim is never thinner than asked for
+    check(label + ': rim never thinner than the wall thickness', lo >= 0.98,
+      'thinnest=' + (lo * WT * 1000).toFixed(3) + ' mm of ' + (WT * 1000) + ' mm');
+    // the smoothness property: along the edges the width is dead even.
+    // A sharp convex corner is the documented exception — its inward
+    // offset cannot be represented without inserting geometry, so the fold
+    // guard leaves those few vertices put, which makes the rim locally
+    // THICKER there (a diamond leaves exactly 4, one per corner).
+    check(label + ': rim is an even width along the edges', p98 - lo < 0.05,
+      'p0-p98=' + lo.toFixed(3) + '-' + p98.toFixed(3) + ' x wt over ' +
+      widths.length + ' inner-edge vertices');
+    check(label + ': corner bulge stays bounded', hi <= 2.0,
+      'worst=' + hi.toFixed(2) + ' x wt');
+    meshChecks(label + ' with placed band', res.built.solid);
+  }
+}
+
 // ---------- pin holes in a rotated frame ----------
 {
   // A rotated selection's mesh axes are its own, not absolute mercator, so
@@ -356,6 +434,31 @@ function lShapeLngLat() {
   }
   check('tiled circle: shared column bit-identical after snapping', colOK);
   check('tiled circle: shared row bit-identical after snapping', rowOK);
+
+  // The wall band runs per tile (a seam is a cut and needs its own wall),
+  // and it MOVES the band's inner ring. Seam vertices are rim vertices and
+  // are never moved, so the shared edges must still match afterwards —
+  // otherwise tiles would no longer meet.
+  {
+    const wtLocal = 0.001 / (totalWidthM / spec.uRange);
+    const cutsFor = (r, c) => ({
+      minU: c > 0, maxU: c < layout.cols - 1,
+      minV: r < layout.rows - 1, maxV: r > 0
+    });
+    Shape.wallBand(s, fr, a.uv, a.m, a.n, a.cells, wtLocal, a.localBox, cutsFor(1, 1));
+    Shape.wallBand(s, fr, b.uv, b.m, b.n, b.cells, wtLocal, b.localBox, cutsFor(1, 2));
+    Shape.wallBand(s, fr, d.uv, d.m, d.n, d.cells, wtLocal, d.localBox, cutsFor(2, 1));
+    let colOK2 = true, rowOK2 = true;
+    for (let j = 0; j < spec.mTile; j++) {
+      const ia = (j * spec.nTile + spec.nTile - 1) * 2, ib = (j * spec.nTile) * 2;
+      if (a.uv[ia] !== b.uv[ib] || a.uv[ia + 1] !== b.uv[ib + 1]) colOK2 = false;
+    }
+    for (let k = 0; k < spec.nTile; k++) {
+      const ia = ((spec.mTile - 1) * spec.nTile + k) * 2, id = k * 2;
+      if (a.uv[ia] !== d.uv[id] || a.uv[ia + 1] !== d.uv[id + 1]) rowOK2 = false;
+    }
+    check('tiled circle: seams still bit-identical after the wall band', colOK2 && rowOK2);
+  }
 
   // every surviving tile must still be a valid printable solid
   const shared = Tiling.sharedZParams({

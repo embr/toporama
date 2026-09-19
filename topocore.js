@@ -1061,11 +1061,19 @@
     var top, bottom, wallMask = null;
     if (shaped) {
       top = shaped.mesh;
-      var gdist = gridBoundaryDistance(m, n, model.cell_keep,
-        (model.cell_u || 0) * info.xy_scale, (model.cell_v || 0) * info.xy_scale);
       wallMask = new Uint8Array(top.numVertices());
-      for (var wi = 0; wi < wallMask.length; wi++)
-        wallMask[wi] = gdist[shaped.gridOf[wi]] <= model.wall_thickness ? 1 : 0;
+      if (model.wall_grid) {
+        // the caller placed the band and put its inner ring exactly on the
+        // inward offset of the outline, so the printed rim is an even width
+        // instead of a staircase (see shapes.js wallBand)
+        for (var wi = 0; wi < wallMask.length; wi++)
+          wallMask[wi] = model.wall_grid[shaped.gridOf[wi]];
+      } else {
+        var gdist = gridBoundaryDistance(m, n, model.cell_keep,
+          (model.cell_u || 0) * info.xy_scale, (model.cell_v || 0) * info.xy_scale);
+        for (var wj = 0; wj < wallMask.length; wj++)
+          wallMask[wj] = gdist[shaped.gridOf[wj]] <= model.wall_thickness ? 1 : 0;
+      }
       info.masked_cells_kept = top.numFaces() / 2;
       bottom = makeBottom(top, model.top_thickness, model.wall_thickness,
         minZarg, wallMask);
