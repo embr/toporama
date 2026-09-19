@@ -1,7 +1,8 @@
 /* Web Worker: assembles the solid and STL off the main thread so the UI
  * stays responsive during the (few-second) mesh build. */
 /* global importScripts, Topo */
-importScripts('topocore.js');
+// clip.js first: topocore uses it to cut the grid against a shape outline
+importScripts('clip.js', 'topocore.js');
 
 self.onmessage = function (e) {
   var msg = e.data;

@@ -20,6 +20,7 @@ const require = createRequire(import.meta.url);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const Topo = require(path.join(__dirname, '..', 'topocore.js'));
 const Shape = require(path.join(__dirname, '..', 'shapes.js'));
+const Clip = require(path.join(__dirname, '..', 'clip.js'));
 
 let failures = 0;
 function check(label, ok, detail) {
@@ -39,102 +40,46 @@ function buildShaped(shape, maxPts, extra) {
   const masked = Shape.needsMask(shape);
   const wtModel = (extra && extra.wall_thickness) || 0.001;
   const outX = (extra && extra.output_x_meters) || 0.3;
-  let mask = null, snap = null, band = null;
-  if (masked) {
-    mask = Shape.cellMask(shape, fr, grid.uv, grid.m, grid.n);
-    snap = Shape.snapBoundary(shape, fr, grid.uv, grid.m, grid.n, mask.cells);
-    const xyScale = outX / (fr.maxU - fr.minU);
-    band = Shape.wallBand(shape, fr, grid.uv, grid.m, grid.n, mask.cells,
-      wtModel / xyScale,
-      { minU: fr.minU, maxU: fr.maxU, minV: fr.minV, maxV: fr.maxV });
-  }
+  const ring = masked ? Shape.localRing(shape, fr) : null;
   const N = grid.m * grid.n;
   const world = new Float64Array(N * 3);
-  let sum = 0, used = 0;
-  const inUse = new Uint8Array(N);
+  let zmin = Infinity, zmax = -Infinity;
   for (let i = 0; i < N; i++) {
     const z = terrain(grid.pts[i * 2], grid.pts[i * 2 + 1]);
     world[i * 3] = grid.uv[i * 2];
     world[i * 3 + 1] = grid.uv[i * 2 + 1];
     world[i * 3 + 2] = z;
-    if (!masked) { inUse[i] = 1; sum += z; used++; continue; }
-    const r = Math.floor(i / grid.n), c = i % grid.n;
-    if (vertexUsed(mask.cells, grid.m, grid.n, r, c)) {
-      inUse[i] = 1; sum += z; used++;
-    }
-  }
-  // unused points sit outside the shape; parking them at the mean keeps
-  // them out of the model's elevation range (see app.js)
-  if (used) {
-    const mean = sum / used;
-    for (let i = 0; i < N; i++) if (!inUse[i]) world[i * 3 + 2] = mean;
+    // points outside the outline stay put — the clip interpolates across
+    // them — but only the ground inside sets the model's range
+    if (ring && !Clip.pointInRing(Clip.toCCW(ring), grid.uv[i * 2], grid.uv[i * 2 + 1]))
+      continue;
+    zmin = Math.min(zmin, z); zmax = Math.max(zmax, z);
   }
   const model = Object.assign({
     output_x_meters: 0.3, output_z_distortion: 3,
     top_thickness: 0.0007, top_pad_width: 0, wall_thickness: 0.001,
     min_z_val: null
   }, extra || {});
-  if (masked) {
-    model.cell_keep = mask.cells;
-    model.cell_u = grid.cellU; model.cell_v = grid.cellV;
-    model.wall_grid = band.wall;
+  if (ring) {
+    model.clip_ring = ring;
+    model.z_range = [zmin, zmax];
   }
   const built = Topo.buildSolid(model, world, grid.m, grid.n);
-  return { built, grid, fr, mask, snap, band, model };
+  return { built, grid, fr, ring, model };
 }
-function vertexUsed(cells, m, n, r, c) {
-  const cw = n - 1;
-  for (let dr = -1; dr <= 0; dr++)
-    for (let dc = -1; dc <= 0; dc++) {
-      const rr = r + dr, cc = c + dc;
-      if (rr < 0 || cc < 0 || rr >= m - 1 || cc >= n - 1) continue;
-      if (cells[rr * cw + cc]) return true;
-    }
-  return false;
-}
-
 // The printed rim is the flat band between the outline and the inner
-// cliff. Measure it where it matters: the exact distance from the outline
-// to each vertex on the band's inner edge.
-function rimWidths(shape, fr, grid, cells, wall) {
-  const { m, n, uv } = grid, cw = n - 1, out = [];
-  const usedAt = (r, c) => vertexUsed(cells, m, n, r, c);
-  for (let r = 0; r < m; r++)
-    for (let c = 0; c < n; c++) {
-      const g = r * n + c;
-      if (!wall[g]) continue;
-      let onEdge = false;
-      for (let dr = -1; dr <= 1; dr++)
-        for (let dc = -1; dc <= 1; dc++) {
-          const rr = r + dr, cc = c + dc;
-          if (rr < 0 || cc < 0 || rr >= m || cc >= n) continue;
-          if (usedAt(rr, cc) && !wall[rr * n + cc]) onEdge = true;
-        }
-      if (!onEdge) continue;
-      const p = Shape.projectToBoundary(shape, fr, uv[g * 2], uv[g * 2 + 1]);
-      out.push(Math.hypot(uv[g * 2] - p[0], uv[g * 2 + 1] - p[1]));
-    }
-  return out;
-}
-
-// Areas of the cells touching the wall band, relative to an untouched
-// grid cell — how much the band placement distorted the mesh around it.
-function bandCellAreas(grid, cells, wall) {
-  const { m, n, uv, cellU, cellV } = grid, cw = n - 1;
-  const nominal = cellU * cellV, out = [];
-  for (let r = 0; r < m - 1; r++)
-    for (let c = 0; c < cw; c++) {
-      if (!cells[r * cw + c]) continue;
-      const idx = [[r, c], [r, c + 1], [r + 1, c + 1], [r + 1, c]];
-      if (!idx.some(([rr, cc]) => wall[rr * n + cc])) continue;
-      let a = 0;
-      for (let k = 0; k < 4; k++) {
-        const [r1, c1] = idx[k], [r2, c2] = idx[(k + 1) % 4];
-        const p = (r1 * n + c1) * 2, q = (r2 * n + c2) * 2;
-        a += uv[p] * uv[q + 1] - uv[q] * uv[p + 1];
-      }
-      out.push(Math.abs(a / 2) / nominal);
-    }
+// cliff. With the grid clipped rather than masked, the cliff is a real
+// ring of vertices on the inward offset, so the width can be measured
+// straight off the solid: the base plane's vertices at radius r give
+// (outline radius - r).
+function rimWidthsCircle(solid, R, minZ) {
+  const v = solid.vertices, out = [];
+  for (let i = 0; i < solid.numVertices(); i++) {
+    if (Math.abs(v[i * 3 + 2] - minZ) > 1e-12) continue;   // on the base plane
+    const r = Math.hypot(v[i * 3], v[i * 3 + 1]);
+    if (r < R * 0.5) continue;
+    out.push(R - r);
+  }
   return out;
 }
 
@@ -212,12 +157,9 @@ function lShapeLngLat() {
   const s = Shape.circle(CENTER, r);
   const { built, grid, mask, snap } = buildShaped(s, 120);
   meshChecks('circle solid', built.solid);
-  check('circle: dropped the corner cells',
-    mask.kept < (grid.m - 1) * (grid.n - 1) * 0.85 &&
-    mask.kept > (grid.m - 1) * (grid.n - 1) * 0.7,
-    'kept=' + mask.kept + '/' + (grid.m - 1) * (grid.n - 1));
-  check('circle: every rim vertex reached the boundary', snap.stuck === 0 && snap.tooFar === 0,
-    'stuck=' + snap.stuck + ' tooFar=' + snap.tooFar + ' passes=' + snap.passes);
+  check('circle: no cell needed the whole-cell fallback',
+    built.info.clip_fallback_cells === 0,
+    'fallback=' + built.info.clip_fallback_cells);
 
   // The printed outline should follow the circle, not the grid staircase.
   // rescalePts is a pure scale about the origin and the circle is centred
@@ -247,8 +189,9 @@ function lShapeLngLat() {
   const s = Shape.poly(lShapeLngLat());
   const { built, mask, snap } = buildShaped(s, 110);
   meshChecks('L-polygon solid', built.solid);
-  check('L-polygon: cells kept and every rim vertex placed',
-    mask.kept > 0 && snap.stuck === 0, 'kept=' + mask.kept + ' stuck=' + snap.stuck);
+  check('L-polygon: no cell needed the whole-cell fallback',
+    built.info.clip_fallback_cells === 0,
+    'fallback=' + built.info.clip_fallback_cells);
   // the notch must really be empty: no top vertex in the NE quadrant
   const tv = built.top.vertices;
   let mnx = Infinity, mxx = -Infinity, mny = Infinity, mxy = -Infinity;
@@ -292,114 +235,76 @@ function lShapeLngLat() {
     'dlat=' + latRow0.toFixed(6));
 }
 
-// ---------- snapBoundary safety ----------
-{
-  // a deliberately coarse circle: snapping has to move corners a long way
-  const s = Shape.circle(CENTER, 5000);
-  const fr = Shape.frame(s);
-  const grid = Shape.buildGrid(s, 14, fr);
-  const mask = Shape.cellMask(s, fr, grid.uv, grid.m, grid.n);
-  const before = Float64Array.from(grid.uv);
-  const res = Shape.snapBoundary(s, fr, grid.uv, grid.m, grid.n, mask.cells);
-  check('snap: it moved something', res.moved > 0, 'moved=' + res.moved);
-  // no kept triangle may be inverted or zero-area after snapping
-  let bad = 0;
-  const cw = grid.n - 1;
-  const area = (a, b, c) =>
-    (grid.uv[b * 2] - grid.uv[a * 2]) * (grid.uv[c * 2 + 1] - grid.uv[a * 2 + 1]) -
-    (grid.uv[b * 2 + 1] - grid.uv[a * 2 + 1]) * (grid.uv[c * 2] - grid.uv[a * 2]);
-  for (let r = 0; r < grid.m - 1; r++)
-    for (let c = 0; c < cw; c++) {
-      if (!mask.cells[r * cw + c]) continue;
-      const v00 = r * grid.n + c, v01 = v00 + 1;
-      const v10 = v00 + grid.n, v11 = v10 + 1;
-      if (area(v00, v10, v11) <= 0) bad++;
-      if (area(v00, v11, v01) <= 0) bad++;
-    }
-  check('snap: no inverted or zero-area cells', bad === 0, 'bad=' + bad);
-  // Vertices well inside — every one of their four cells kept — must not
-  // move at all; only the rim is reshaped. (Vertices that are inside the
-  // shape but ON the kept region's edge DO move outward onto the boundary;
-  // that is what removes the sawtooth.)
-  let movedInterior = 0;
-  for (let r = 0; r < grid.m; r++)
-    for (let c = 0; c < grid.n; c++) {
-      let allKept = true;
-      for (let dr = -1; dr <= 0; dr++)
-        for (let dc = -1; dc <= 0; dc++) {
-          const rr = r + dr, cc = c + dc;
-          if (rr < 0 || cc < 0 || rr >= grid.m - 1 || cc >= cw ||
-              !mask.cells[rr * cw + cc]) allKept = false;
-        }
-      if (!allKept) continue;
-      const i = r * grid.n + c;
-      if (grid.uv[i * 2] !== before[i * 2] ||
-          grid.uv[i * 2 + 1] !== before[i * 2 + 1]) movedInterior++;
-    }
-  check('snap: true interior vertices untouched', movedInterior === 0,
-    'moved=' + movedInterior);
-}
-
-// ---------- the printed rim must be an even width, on any edge angle ----
-// The flat base band's inner edge used to be decided per grid vertex, so
-// it staircased: on a circle the rim measured 0.51-1.41 mm against a 1.00
-// mm target — sawtoothed from underneath, and below the material minimum
-// at the thin points. It shows on anything not parallel to the grid, so a
-// diagonal-edged polygon is checked alongside the circle.
+// ---------- the printed rim, on any edge angle ----------
+// Clipping puts real vertices on the outline and on its inward offset, so
+// the base band's two rings ARE those curves. Every vertex sitting on the
+// base plane must therefore be either exactly on the outline or exactly a
+// wall thickness inside it — no staircase, no sawtooth, and nothing in
+// between. This is the property the old vertex-snapping could only
+// approximate, and only along straight runs.
 {
   const WT = 0.001, OUT_X = 0.3;
   const cases = [
     ['circle', Shape.circle(CENTER, 5000), 150],
-    // a diamond: all four edges run at 45 degrees to the sample grid
+    // a diamond: every edge runs at 45 degrees to the sample grid
     ['diagonal polygon', Shape.poly([[0, 5200], [5200, 0], [0, -5200], [-5200, 0]]
       .map(p => Shape.localToLngLat(
         Shape.frame(Shape.rect(CENTER, 1, 1, 0)), p[0], p[1]))), 150],
-    // an irregular outline with both shallow and steep edge angles
     ['irregular polygon', Shape.poly([[-5000, -4000], [1500, -5200], [5200, 900],
       [2400, 4800], [-3600, 3900]]
       .map(p => Shape.localToLngLat(
         Shape.frame(Shape.rect(CENTER, 1, 1, 0)), p[0], p[1]))), 150],
-    // concave: the inward offset has to survive a notch
     ['L polygon', Shape.poly(lShapeLngLat()), 150]
   ];
   for (const [label, shp, pts] of cases) {
     const res = buildShaped(shp, pts, { wall_thickness: WT, output_x_meters: OUT_X });
+    meshChecks(label + ' clipped', res.built.solid);
+    check(label + ': no cell needed the whole-cell fallback',
+      res.built.info.clip_fallback_cells === 0,
+      'fallback=' + res.built.info.clip_fallback_cells);
+
     const xyScale = OUT_X / (res.fr.maxU - res.fr.minU);
     const wtLocal = WT / xyScale;
-    const widths = rimWidths(shp, res.fr, res.grid, res.mask.cells, res.band.wall)
-      .map(w => w / wtLocal).sort((a, b) => a - b);
-    const lo = widths[0], hi = widths[widths.length - 1];
-    const p98 = widths[Math.floor(0.98 * (widths.length - 1))];
-    // the safety property: the rim is never thinner than asked for
-    check(label + ': rim never thinner than the wall thickness', lo >= 0.98,
-      'thinnest=' + (lo * WT * 1000).toFixed(3) + ' mm of ' + (WT * 1000) + ' mm');
-    // the smoothness property: along the edges the width is dead even.
-    // A sharp convex corner is the documented exception — its inward
-    // offset cannot be represented without inserting geometry, so the fold
-    // guard leaves those few vertices put, which makes the rim locally
-    // THICKER there (a diamond leaves exactly 4, one per corner).
-    check(label + ': rim is an even width along the edges', p98 - lo < 0.05,
-      'p0-p98=' + lo.toFixed(3) + '-' + p98.toFixed(3) + ' x wt over ' +
-      widths.length + ' inner-edge vertices');
-    check(label + ': corner bulge stays bounded', hi <= 2.0,
-      'worst=' + hi.toFixed(2) + ' x wt');
-    // Placing the inner ring squeezes the cells just inside it. If all of
-    // that squeeze lands on one row they collapse into slivers — a full
-    // cell long but a fraction of one across — which show up as stray
-    // extra edges just inside the rim. The relaxation shares it outward.
-    const areas = bandCellAreas(res.grid, res.mask.cells, res.band.wall)
-      .sort((a, b) => a - b);
-    const pinched = areas.filter(a => a < 0.2).length;
-    // Along the edges the relaxation clears them entirely. A handful
-    // survive where a polygon's convex corner makes the two edges' inward
-    // offsets converge, which vertex-snapping cannot open up; they stay
-    // thin but never degenerate. Clipping the grid against the boundary
-    // (rather than moving its vertices) is what removes these for good.
-    check(label + ': pinched cells are rare and never degenerate',
-      pinched <= 2 && areas[0] > 1e-3,
-      'smallest=' + areas[0].toFixed(4) + ' of nominal, ' + pinched +
-      ' under 0.2 of ' + areas.length);
-    meshChecks(label + ' with placed band', res.built.solid);
+    // measured against the two POLYLINES the mesh is actually cut to — the
+    // outline as given (a circle is a 180-gon, whose chords sit a sagitta
+    // inside the ideal circle) and its inward offset
+    const outline = Clip.toCCW(Shape.localRing(shp, res.fr));
+    const offset = Clip.offsetRingInward(outline, wtLocal);
+    const distTo = (ring, u, v) => {
+      let best = Infinity;
+      for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+        const ax = ring[j][0], ay = ring[j][1];
+        const ex = ring[i][0] - ax, ey = ring[i][1] - ay;
+        const L2 = ex * ex + ey * ey;
+        let t = L2 ? ((u - ax) * ex + (v - ay) * ey) / L2 : 0;
+        t = Math.max(0, Math.min(1, t));
+        best = Math.min(best, Math.hypot(u - ax - t * ex, v - ay - t * ey));
+      }
+      return best;
+    };
+    const solid = res.built.solid, v = solid.vertices;
+    let minZ = Infinity;
+    for (let i = 0; i < solid.numVertices(); i++)
+      minZ = Math.min(minZ, v[i * 3 + 2]);
+    let onOutline = 0, onOffset = 0, stray = 0, worstOff = 0;
+    for (let i = 0; i < solid.numVertices(); i++) {
+      if (Math.abs(v[i * 3 + 2] - minZ) > 1e-12) continue;
+      const lu = v[i * 3] / xyScale, lv = v[i * 3 + 1] / xyScale;
+      const dOut = distTo(outline, lu, lv), dOff = distTo(offset, lu, lv);
+      if (dOut < 1e-4 * wtLocal) onOutline++;
+      else if (dOff < 1e-3 * wtLocal) {
+        onOffset++;
+        worstOff = Math.max(worstOff, dOff / wtLocal);
+      } else stray++;
+    }
+    check(label + ': base band has both rings',
+      onOutline > 20 && onOffset > 20,
+      'outline=' + onOutline + ' offset=' + onOffset);
+    check(label + ': every base-plane vertex is on the outline or the offset',
+      stray === 0, 'stray=' + stray + ' of ' +
+      (onOutline + onOffset + stray));
+    check(label + ': the rim is exactly the wall thickness',
+      worstOff < 1e-3, 'worst=' + (worstOff * 100).toExponential(2) + '% off');
   }
 }
 
@@ -437,76 +342,45 @@ function lShapeLngLat() {
   meshChecks('circle ignoring pins', r2.built.solid);
 }
 
-// ---------- tiled + masked: seams must still line up ----------
+// ---------- tiled + clipped ----------
 {
   const Tiling = require(path.join(__dirname, '..', 'tiling.js'));
   const s = Shape.circle(CENTER, 5000);
   const fr = Shape.frame(s);
   const totalWidthM = 0.4;
-  // force a 3x3 cut across the circle's bounding box
+  const ring = Shape.localRing(s, fr);
   const layout = Tiling.computeLayout(fr, totalWidthM, totalWidthM / 3, totalWidthM / 3);
   check('tiled circle: 3x3 layout', layout.rows === 3 && layout.cols === 3,
     layout.cols + 'x' + layout.rows);
   const spec = Tiling.buildGridSpec(fr, fr, layout.rows, layout.cols, 40);
-  const mi = Tiling.maskGlobal(s, spec);
-  check('tiled circle: global mask dropped corners',
-    mi.kept > 0 && mi.kept < (spec.NY - 1) * (spec.NX - 1) * 0.9,
-    'kept=' + mi.kept);
-  check('tiled circle: every rim vertex reached the boundary',
-    mi.snap.stuck === 0, 'stuck=' + mi.snap.stuck);
 
-  // shared edges must stay bit-identical THROUGH the mask + snap — this is
-  // what breaks if masking is done per tile instead of globally
-  const a = Tiling.tileSlice(spec, 1, 1), b = Tiling.tileSlice(spec, 1, 2);
-  const d = Tiling.tileSlice(spec, 2, 1);
+  // the sample grid is untouched by clipping, so shared edges stay
+  // bit-identical for free — no mask, no snapping to keep in step
+  const a2 = Tiling.tileSlice(spec, 1, 1), b2 = Tiling.tileSlice(spec, 1, 2);
+  const d2 = Tiling.tileSlice(spec, 2, 1);
   let colOK = true, rowOK = true;
   for (let j = 0; j < spec.mTile; j++) {
     const ia = (j * spec.nTile + spec.nTile - 1) * 2, ib = (j * spec.nTile) * 2;
-    if (a.uv[ia] !== b.uv[ib] || a.uv[ia + 1] !== b.uv[ib + 1]) colOK = false;
-    if (a.pts[ia] !== b.pts[ib] || a.pts[ia + 1] !== b.pts[ib + 1]) colOK = false;
+    if (a2.uv[ia] !== b2.uv[ib] || a2.uv[ia + 1] !== b2.uv[ib + 1]) colOK = false;
+    if (a2.pts[ia] !== b2.pts[ib] || a2.pts[ia + 1] !== b2.pts[ib + 1]) colOK = false;
   }
   for (let k = 0; k < spec.nTile; k++) {
     const ia = ((spec.mTile - 1) * spec.nTile + k) * 2, id = k * 2;
-    if (a.uv[ia] !== d.uv[id] || a.uv[ia + 1] !== d.uv[id + 1]) rowOK = false;
+    if (a2.uv[ia] !== d2.uv[id] || a2.uv[ia + 1] !== d2.uv[id + 1]) rowOK = false;
   }
-  check('tiled circle: shared column bit-identical after snapping', colOK);
-  check('tiled circle: shared row bit-identical after snapping', rowOK);
+  check('tiled circle: shared column bit-identical', colOK);
+  check('tiled circle: shared row bit-identical', rowOK);
 
-  // The wall band runs per tile (a seam is a cut and needs its own wall),
-  // and it MOVES the band's inner ring. Seam vertices are rim vertices and
-  // are never moved, so the shared edges must still match afterwards —
-  // otherwise tiles would no longer meet.
-  {
-    const wtLocal = 0.001 / (totalWidthM / spec.uRange);
-    const cutsFor = (r, c) => ({
-      minU: c > 0, maxU: c < layout.cols - 1,
-      minV: r < layout.rows - 1, maxV: r > 0
-    });
-    Shape.wallBand(s, fr, a.uv, a.m, a.n, a.cells, wtLocal, a.localBox, cutsFor(1, 1));
-    Shape.wallBand(s, fr, b.uv, b.m, b.n, b.cells, wtLocal, b.localBox, cutsFor(1, 2));
-    Shape.wallBand(s, fr, d.uv, d.m, d.n, d.cells, wtLocal, d.localBox, cutsFor(2, 1));
-    let colOK2 = true, rowOK2 = true;
-    for (let j = 0; j < spec.mTile; j++) {
-      const ia = (j * spec.nTile + spec.nTile - 1) * 2, ib = (j * spec.nTile) * 2;
-      if (a.uv[ia] !== b.uv[ib] || a.uv[ia + 1] !== b.uv[ib + 1]) colOK2 = false;
-    }
-    for (let k = 0; k < spec.nTile; k++) {
-      const ia = ((spec.mTile - 1) * spec.nTile + k) * 2, id = k * 2;
-      if (a.uv[ia] !== d.uv[id] || a.uv[ia + 1] !== d.uv[id + 1]) rowOK2 = false;
-    }
-    check('tiled circle: seams still bit-identical after the wall band', colOK2 && rowOK2);
-  }
-
-  // every surviving tile must still be a valid printable solid
   const shared = Tiling.sharedZParams({
     totalWidthM, uRange: spec.uRange, zMin: 500, zMax: 2500,
     topThickness: 0.0007, outputZDistortion: 3
   });
-  let builtTiles = 0, dropped = 0, badTile = null;
+  let builtTiles = 0, dropped = 0, bad = null, fallbacks = 0;
   for (let r = 0; r < layout.rows; r++) {
     for (let c = 0; c < layout.cols; c++) {
       const t = Tiling.tileSlice(spec, r, c);
-      if (t.cells && !t.cells.keptCount) { dropped++; continue; }
+      const tileRing = Clip.clipRingToBox(ring, t.localBox);
+      if (tileRing.length < 3) { dropped++; continue; }
       const world = new Float64Array(t.m * t.n * 3);
       for (let p = 0; p < t.m * t.n; p++) {
         world[p * 3] = t.uv[p * 2];
@@ -517,34 +391,34 @@ function lShapeLngLat() {
         output_x_meters: totalWidthM / layout.cols,
         output_z_distortion: shared.distortion, min_z_val: shared.minZVal,
         top_thickness: 0.0007, top_pad_width: 0, wall_thickness: 0.001,
-        tiled: true, cell_keep: t.cells,
-        cell_u: spec.cellU, cell_v: spec.cellV
+        tiled: true, clip_ring: tileRing
       }, world, t.m, t.n);
+      fallbacks += built.info.clip_fallback_cells || 0;
       if (!Topo.isWatertight(built.solid) ||
-          !Topo.isWindingConsistent(built.solid)) {
-        badTile = badTile || ('r' + r + 'c' + c);
-      }
+          !Topo.isWindingConsistent(built.solid)) bad = bad || ('r' + r + 'c' + c);
       builtTiles++;
     }
   }
   check('tiled circle: every surviving tile is watertight and consistent',
-    builtTiles > 0 && !badTile,
-    'built=' + builtTiles + ' dropped=' + dropped + ' bad=' + badTile);
+    builtTiles > 0 && !bad,
+    'built=' + builtTiles + ' dropped=' + dropped + ' bad=' + bad);
+  check('tiled circle: no tile needed the whole-cell fallback',
+    fallbacks === 0, 'fallback=' + fallbacks);
 
-  // a shape that misses a whole tile should leave that tile empty so the
-  // build can skip it instead of shipping a blank piece
+  // a shape that misses a tile entirely clips to nothing there
   const baseFr = Shape.frame(Shape.rect(CENTER, 5000, 5000, 0));
   const tri = Shape.poly([[-4800, -4800], [-600, -4800], [-4800, -600]]
     .map(p => Shape.localToLngLat(baseFr, p[0], p[1])));
   const tfr = Shape.frame(tri);
   const tspec = Tiling.buildGridSpec(tfr, tfr, 2, 2, 40);
-  Tiling.maskGlobal(tri, tspec);
-  const counts = [];
+  const triRing = Shape.localRing(tri, tfr);
+  const empties = [];
   for (let r = 0; r < 2; r++)
     for (let c = 0; c < 2; c++)
-      counts.push(Tiling.tileSlice(tspec, r, c).cells.keptCount);
-  check('triangle: one of four tiles is entirely outside',
-    counts.filter(x => x === 0).length === 1, 'counts=' + counts.join(','));
+      empties.push(Clip.clipRingToBox(triRing,
+        Tiling.tileSlice(tspec, r, c).localBox).length);
+  check('triangle: one of four tiles clips to nothing',
+    empties.filter(x => x < 3).length === 1, 'sizes=' + empties.join(','));
 }
 
 console.log(failures ? '\n' + failures + ' FAILURE(S)' : '\nall shape tests passed');

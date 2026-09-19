@@ -15,11 +15,11 @@
  */
 (function (root, factory) {
   if (typeof module === 'object' && module.exports) {
-    module.exports = factory();
+    module.exports = factory(require('./clip.js'));
   } else {
-    root.Topo = factory();
+    root.Topo = factory(root.TopoClip);
   }
-}(typeof self !== 'undefined' ? self : this, function () {
+}(typeof self !== 'undefined' ? self : this, function (Clip) {
   'use strict';
 
   // --- Web Mercator (EPSG:3857) --------------------------------------
@@ -702,7 +702,7 @@
     return [zMin, zMax];
   }
 
-  function rescalePts(pts, outputXMeters, outputZMeters, zDistortion) {
+  function rescalePts(pts, outputXMeters, outputZMeters, zDistortion, zRange) {
     var N = pts.length / 3, i;
     var minX = Infinity, minY = Infinity, minZ = Infinity;
     for (i = 0; i < N; i++) {
@@ -719,9 +719,16 @@
     var zScale;
     if (outputZMeters !== null && outputZMeters !== undefined) {
       var maxZcentered = -Infinity;
-      for (i = 0; i < N; i++) {
-        var zc = pts[i * 3 + 2] - minZ;
-        if (zc > maxZcentered) maxZcentered = zc;
+      if (zRange) {
+        // A clipped shape's grid still holds points outside the outline —
+        // the clip interpolates across them — but they are not part of the
+        // model, so the caller passes the range of the ground that is.
+        maxZcentered = zRange[1] - zRange[0];
+      } else {
+        for (i = 0; i < N; i++) {
+          var zc = pts[i * 3 + 2] - minZ;
+          if (zc > maxZcentered) maxZcentered = zc;
+        }
       }
       if (maxZcentered <= 0) throw new Error('elevation range is zero; use elevation distortion instead');
       zScale = outputZMeters / maxZcentered;
@@ -1037,6 +1044,103 @@
   //         top_thickness, top_pad_width, wall_thickness, min_z_val,
   //         distortion_exponent?, distortion_normalization_min/max?,
   //         tiled?, upload_scale?, pin_holes?}
+  // Offset a surface along its own normals — the shell's underside before
+  // it is flattened into a height field. Offsetting along the normal (not
+  // straight down) is what keeps the shell a uniform thickness on a slope.
+  function offsetAlongNormals(mesh, t) {
+    var vn = vertexNormals(mesh);
+    var out = new Float64Array(mesh.vertices);
+    for (var i = 0; i < mesh.numVertices(); i++) {
+      out[i * 3] -= t * vn[i * 3];
+      out[i * 3 + 1] -= t * vn[i * 3 + 1];
+      out[i * 3 + 2] -= t * vn[i * 3 + 2];
+    }
+    return new Mesh(out, mesh.faces);
+  }
+
+  // Bilinear lookup into a grid-shaped scalar field.
+  function sampleGridField(field, uvArr, m, n, u, v) {
+    var minU = uvArr[0], maxV = uvArr[1];
+    var uStep = uvArr[2] - uvArr[0], vStep = maxV - uvArr[n * 2 + 1];
+    var cf = (u - minU) / uStep, rf = (maxV - v) / vStep;
+    var c0 = Math.max(0, Math.min(n - 2, Math.floor(cf)));
+    var r0 = Math.max(0, Math.min(m - 2, Math.floor(rf)));
+    var fu = Math.max(0, Math.min(1, cf - c0)), fv = Math.max(0, Math.min(1, rf - r0));
+    return field[r0 * n + c0] * (1 - fu) * (1 - fv) +
+           field[r0 * n + c0 + 1] * fu * (1 - fv) +
+           field[(r0 + 1) * n + c0] * (1 - fu) * fv +
+           field[(r0 + 1) * n + c0 + 1] * fu * fv;
+  }
+
+  // A shape that is not a plain rectangle is built by CLIPPING the grid
+  // against its outline rather than by masking whole cells: the grid keeps
+  // its own vertices, and new ones are inserted where the boundary crosses
+  // it, so the printed edge is the outline itself. The underside repeats
+  // the construction against the outline offset inward by the wall
+  // thickness, which makes the base rim exactly that wide by construction.
+  function buildClipped(model, ptsWorld, m, n, info) {
+    var i, N = m * n;
+    var uvArr = new Float64Array(N * 2), zArr = new Float64Array(N);
+    for (i = 0; i < N; i++) {
+      uvArr[i * 2] = ptsWorld[i * 3];
+      uvArr[i * 2 + 1] = ptsWorld[i * 3 + 1];
+      zArr[i] = ptsWorld[i * 3 + 2];
+    }
+    // the ring arrives in pre-rescale local metres; rescalePts is a pure
+    // scale about the origin, so the same factor carries it across
+    var sc = info.xy_scale;
+    var ring = model.clip_ring.map(function (p) { return [p[0] * sc, p[1] * sc]; });
+
+    var top = Clip.clipGrid(uvArr, m, n, zArr, ring);
+    if (!top.faces.length)
+      throw new Error('the shape covers no grid cells — enlarge it or raise the grid points');
+    var topMesh = new Mesh(top.vertices, top.faces);
+
+    // underside as a height field: offset along the normals, then read it
+    // back vertically, then hold it at least a full thickness below the top
+    var hullMesh = offsetAlongNormals(topMesh, model.top_thickness);
+    var hz = verticalMinProjection(hullMesh, uvArr, Infinity);
+    for (i = 0; i < N; i++) {
+      var lim = zArr[i] - model.top_thickness;
+      if (!(hz[i] < lim)) hz[i] = lim;
+    }
+
+    var minZ = (model.min_z_val === undefined || model.min_z_val === null)
+      ? null : model.min_z_val;
+    if (minZ === null) {
+      minZ = Infinity;
+      var tv = topMesh.vertices, minTop = Infinity;
+      for (i = 0; i < topMesh.numVertices(); i++) {
+        var hv = sampleGridField(hz, uvArr, m, n, tv[i * 3], tv[i * 3 + 1]);
+        if (hv < minZ) minZ = hv;
+        if (tv[i * 3 + 2] < minTop) minTop = tv[i * 3 + 2];
+      }
+      // never let the base plane sit less than a full thickness below the
+      // lowest point of the top surface
+      if (minTop - model.top_thickness < minZ) minZ = minTop - model.top_thickness;
+    }
+
+    var shell = Clip.buildShell(uvArr, m, n, zArr, hz, ring,
+      model.wall_thickness, minZ, top);
+    info.clip_fallback_cells = shell.info.fallback;
+    if (shell.info.why && shell.info.why.length) info.clip_why = shell.info.why;
+    if (shell.info.solid) info.printed_solid = true;
+
+    var solid = weld(appendMeshes(shell.pieces.map(function (p) {
+      return new Mesh(p.vertices, Int32Array.from(p.faces));
+    })), 9);
+
+    // a bottom that pairs with the top vertex for vertex, which is what
+    // checkShell measures the shell thickness across
+    var bv = new Float64Array(topMesh.vertices);
+    for (i = 0; i < topMesh.numVertices(); i++)
+      bv[i * 3 + 2] = Math.min(
+        sampleGridField(hz, uvArr, m, n, bv[i * 3], bv[i * 3 + 1]),
+        topMesh.vertices[i * 3 + 2] - model.top_thickness);
+    return { solid: solid, top: topMesh,
+             bottom: new Mesh(bv, topMesh.faces), info: info };
+  }
+
   function buildSolid(model, ptsWorld, m, n) {
     var info = {};
     if (model.distortion_exponent !== undefined && model.distortion_exponent !== null) {
@@ -1047,10 +1151,16 @@
       info.distortion_normalization_max = norm[1];
     }
     var scale = rescalePts(ptsWorld, model.output_x_meters,
-      model.output_z_meters, model.output_z_distortion);
+      model.output_z_meters, model.output_z_distortion, model.z_range);
     info.xy_scale = scale.xyScale;
     info.z_scale = scale.zScale;
     info.output_z_distortion = scale.zDistortion;
+
+    if (model.clip_ring) {
+      if (model.pin_holes && model.pin_holes.locations &&
+          model.pin_holes.locations.length) info.pin_holes_unsupported = true;
+      return buildClipped(model, ptsWorld, m, n, info);
+    }
 
     // A masked grid (circle, polygon, or a tile only partly covered by
     // one) drops cells and so has a boundary that is not its bbox: build

@@ -810,61 +810,34 @@ function buildModelConfig() {
 }
 
 // ---- shape-aware sample grid -------------------------------------------
-// Builds the grid in the shape's local frame, clamps the grid points to
-// the printable triangle cap, and (for a circle or polygon) masks the
-// cells outside the shape and pulls the surviving outside corners onto
-// the true boundary. Mutates `model` with the mask and cell size.
-function prepareShapeGrid(model, maxPts, what, fr, localBox) {
+// Builds the grid in the shape's local frame and clamps the grid points to
+// the printable triangle cap. For a circle or polygon it also hands the
+// mesh builder the outline itself: the grid is then CLIPPED against it
+// (see clip.js), rather than having whole cells masked away, so the
+// printed edge is the outline and no grid vertex is ever moved.
+function prepareShapeGrid(model, maxPts, what, fr) {
   fr = fr || TopoShape.frame(shape);
-  var masked = TopoShape.needsMask(shape);
-  function build(mp) {
-    if (localBox) {
-      var d = TopoShape.gridDims(localBox.maxU - localBox.minU,
-        localBox.maxV - localBox.minV, mp);
-      return TopoShape.sampleGrid(fr, localBox.minU, localBox.maxU,
-        localBox.minV, localBox.maxV, d.m, d.n);
-    }
-    return TopoShape.buildGrid(shape, mp, fr);
-  }
+  var ring = TopoShape.needsMask(shape) ? TopoShape.localRing(shape, fr) : null;
+  function build(mp) { return TopoShape.buildGrid(shape, mp, fr); }
   var grid = build(maxPts);
-  var mask = masked
-    ? TopoShape.cellMask(shape, fr, grid.uv, grid.m, grid.n) : null;
-  var cells = mask ? mask.kept : (grid.m - 1) * (grid.n - 1);
-  var mp2 = clampGridPoints(maxPts, 4 * cells, what);
+  // clipping keeps roughly the outline's share of the bounding box, so a
+  // circle fits about a third more grid points under the triangle cap
+  var fill = 1;
+  if (ring) {
+    var boxArea = (fr.maxU - fr.minU) * (fr.maxV - fr.minV);
+    fill = Math.max(0.05, Math.min(1,
+      Math.abs(TopoClip.ringArea(ring)) / boxArea));
+  }
+  var mp2 = clampGridPoints(maxPts,
+    4 * (grid.m - 1) * (grid.n - 1) * fill, what);
   if (mp2 !== maxPts) {
     model.max_points_requested = maxPts;
     model.max_points = mp2;
     grid = build(mp2);
-    mask = masked
-      ? TopoShape.cellMask(shape, fr, grid.uv, grid.m, grid.n) : null;
   }
-  if (mask) {
-    if (!mask.kept)
-      throw new Error('the shape covers no grid cells — enlarge it or raise the grid points');
-    log('boundary snap:',
-      TopoShape.snapBoundary(shape, fr, grid.uv, grid.m, grid.n, mask.cells));
-    model.cell_keep = mask.cells;
-    model.cell_u = grid.cellU;
-    model.cell_v = grid.cellV;
-    model.wall_grid = shapeWallBand(model, shape, fr, grid.uv, grid.m, grid.n,
-      mask.cells, localBox || fr);
-    // vertices moved, so re-derive where to sample elevation
-    TopoShape.refreshLngLat(fr, grid.uv, grid.pts, grid.m * grid.n);
-  }
-  grid.mask = mask;
+  if (ring) model.clip_ring = ring;
+  grid.ring = ring;
   return grid;
-}
-
-// Place the flat base band and slide its inner ring onto the exact inward
-// offset of the outline. wall_thickness is in model metres, so convert it
-// to the local frame's metres first. Mutates `uv` (the inner ring moves).
-function shapeWallBand(model, shp, fr, uv, m, n, cells, localBox, cuts) {
-  var xyScale = model.output_x_meters / (fr.maxU - fr.minU);
-  var wtLocal = model.wall_thickness / xyScale;
-  var band = TopoShape.wallBand(shp, fr, uv, m, n, cells, wtLocal, localBox, cuts);
-  log('wall band:', { ring: band.ring, moved: band.moved,
-                      stuck: band.stuck, passes: band.passes });
-  return band.wall;
 }
 
 // (x, y, elevation) in the shape's local frame — what the mesh is built on.
@@ -876,40 +849,35 @@ function worldFromGrid(grid, elevs) {
     world[i * 3 + 1] = grid.uv[i * 2 + 1];
     world[i * 3 + 2] = elevs[i];
   }
-  if (grid.mask) neutralizeUnusedCells(world, grid.m, grid.n, grid.mask.cells);
   return world;
 }
 
-// Is this grid vertex a corner of any surviving cell?
-function gridVertexUsed(cells, m, n, r, c) {
-  var cw = n - 1;
-  for (var dr = -1; dr <= 0; dr++)
-    for (var dc = -1; dc <= 0; dc++) {
-      var rr = r + dr, cc = c + dc;
-      if (rr < 0 || cc < 0 || rr >= m - 1 || cc >= n - 1) continue;
-      if (cells[rr * cw + cc]) return true;
-    }
-  return false;
-}
-
-// Grid points outside the shape never reach the mesh, but rescalePts still
-// scans the whole array to work out the elevation range. Parking them at
-// the mean of the used points stops terrain OUTSIDE the selection from
-// deciding the model's thickness or its distortion normalization.
-function neutralizeUnusedCells(world, m, n, cells) {
-  var cw = n - 1;
-  var used = new Uint8Array(m * n), r, c, i;
-  for (r = 0; r < m - 1; r++)
-    for (c = 0; c < cw; c++) {
-      if (!cells[r * cw + c]) continue;
-      used[r * n + c] = 1; used[r * n + c + 1] = 1;
-      used[(r + 1) * n + c] = 1; used[(r + 1) * n + c + 1] = 1;
-    }
-  var sum = 0, k = 0;
-  for (i = 0; i < m * n; i++) if (used[i]) { sum += world[i * 3 + 2]; k++; }
-  if (!k) return;
-  var mean = sum / k;
-  for (i = 0; i < m * n; i++) if (!used[i]) world[i * 3 + 2] = mean;
+// The model's height comes from the ground INSIDE the shape: a peak in a
+// circle's discarded corners must not decide the thickness or flatten the
+// distortion. Grid points outside are still needed — the clip interpolates
+// across them to place the boundary — so the range is narrowed here rather
+// than by editing their elevations.
+function applyShapeZRange(model, grid, elevs) {
+  if (!grid.ring) return;
+  var zmin = Infinity, zmax = -Infinity, seen = 0;
+  for (var i = 0; i < grid.m * grid.n; i++) {
+    if (!TopoClip.pointInRing(grid.ring, grid.uv[i * 2], grid.uv[i * 2 + 1]))
+      continue;
+    seen++;
+    if (elevs[i] < zmin) zmin = elevs[i];
+    if (elevs[i] > zmax) zmax = elevs[i];
+  }
+  if (!seen || !(zmax > zmin)) return;
+  model.z_range = [zmin, zmax];
+  if (model.distortion_exponent !== undefined &&
+      model.distortion_exponent !== null) {
+    if (model.distortion_normalization_min === undefined ||
+        model.distortion_normalization_min === null)
+      model.distortion_normalization_min = zmin;
+    if (model.distortion_normalization_max === undefined ||
+        model.distortion_normalization_max === null)
+      model.distortion_normalization_max = zmax;
+  }
 }
 
 // ---- elevation cache ----------------------------------------------------
@@ -1131,6 +1099,7 @@ function doBuild() {
     $('building-label').textContent = 'Building mesh…';
     // the mesh is built on the shape's own axes (see prepareShapeGrid), so
     // a rotated selection still prints as an upright model
+    applyShapeZRange(model, grid, elev.elevs);
     var world = worldFromGrid(grid, elev.elevs);
     var midLat = 0.5 * (model.north + model.south);
     var gridSpacing = grid.cellU * Math.cos(midLat * Math.PI / 180);
@@ -1178,6 +1147,7 @@ function doBuildTiled(model, useGoogle, fetchOpts) {
   }
   var fr = TopoShape.frame(shape);
   var masked = TopoShape.needsMask(shape);
+  var shapeRing = masked ? TopoShape.localRing(shape, fr) : null;
   var layout, spec;
   try {
     layout = TopoTiling.computeLayout(fr, model.output_x_meters,
@@ -1189,11 +1159,12 @@ function doBuildTiled(model, useGoogle, fetchOpts) {
       var sp = TopoTiling.buildGridSpec(fr, fr, layout.rows, layout.cols, mp);
       var perTile = (sp.mTile - 1) * (sp.nTile - 1);
       if (masked) {
-        var mi = TopoTiling.maskGlobal(shape, sp);
-        if (!mi.kept)
-          throw new Error('the shape covers no grid cells — enlarge it or raise the grid points');
-        log('tiled boundary snap:', mi.snap);
-        perTile = Math.ceil(mi.kept / layout.count);
+        // clipping keeps the outline's share of each tile, so the triangle
+        // budget per tile scales with how much of it the shape covers
+        var boxArea = (fr.maxU - fr.minU) * (fr.maxV - fr.minV);
+        var fillFrac = Math.max(0.05, Math.min(1,
+          Math.abs(TopoClip.ringArea(shapeRing)) / boxArea));
+        perTile = Math.ceil(perTile * fillFrac);
       }
       sp.perTileCells = perTile;
       return sp;
@@ -1216,21 +1187,12 @@ function doBuildTiled(model, useGoogle, fetchOpts) {
   for (var r = 0; r < layout.rows; r++) {
     for (var c = 0; c < layout.cols; c++) {
       var sl = TopoTiling.tileSlice(spec, r, c);
-      if (sl.cells && !sl.cells.keptCount) continue;
-      if (sl.cells) {
-        // Place the band per tile — a tile's seam cuts are boundaries too
-        // and need their own wall. It has to happen BEFORE elevation is
-        // fetched, because it moves vertices and each one's height is read
-        // at its lat/lng. `model` (not the per-tile copy) carries the
-        // global width, which is what pairs with the global frame to give
-        // the right scale. Seam vertices are rim vertices and never move,
-        // so tiles still meet exactly.
-        sl.wallGrid = shapeWallBand(model, shape, fr, sl.uv, sl.m, sl.n,
-          sl.cells, sl.localBox, {
-            minU: c > 0, maxU: c < layout.cols - 1,
-            minV: r < layout.rows - 1, maxV: r > 0
-          });
-        TopoShape.refreshLngLat(fr, sl.uv, sl.pts, sl.m * sl.n);
+      if (shapeRing) {
+        // A tile's outline is the shape intersected with the tile's own
+        // rectangle, so its seams become part of the ring and get their
+        // own wall. A tile the shape misses entirely clips to nothing.
+        sl.clipRing = TopoClip.clipRingToBox(shapeRing, sl.localBox);
+        if (sl.clipRing.length < 3) continue;
       }
       slices.push(sl);
     }
@@ -1289,10 +1251,10 @@ function doBuildTiled(model, useGoogle, fetchOpts) {
     // the model's elevation range comes only from points the mesh keeps:
     // terrain in a circle's discarded corners must not set the thickness
     var zminG = Infinity, zmaxG = -Infinity;
-    var gcw = spec.NX - 1;
     for (var gj = 0; gj < spec.NY; gj++) {
       for (var gk = 0; gk < spec.NX; gk++) {
-        if (spec.cells && !gridVertexUsed(spec.cells, spec.NY, spec.NX, gj, gk)) continue;
+        if (shapeRing && !TopoClip.pointInRing(shapeRing,
+            spec.us[gk], spec.vs[gj])) continue;
         var gz = globalElevs[gj * spec.NX + gk];
         if (gz < zminG) zminG = gz;
         if (gz > zmaxG) zmaxG = gz;
@@ -1342,14 +1304,8 @@ function doBuildTiled(model, useGoogle, fetchOpts) {
                          diameter_mm: model.pin_holes.diameter_mm };
       else delete tm.pin_holes;
 
-      if (t.cells) {
-        tm.cell_keep = t.cells;
-        tm.cell_u = spec.cellU; tm.cell_v = spec.cellV;
-        tm.wall_grid = t.wallGrid;      // placed before the elevation fetch
-      } else {
-        delete tm.cell_keep;
-        delete tm.wall_grid;
-      }
+      if (t.clipRing) tm.clip_ring = t.clipRing;
+      else delete tm.clip_ring;
       tm.local_box = t.localBox;     // this tile's own frame box (imagery)
       var elevs = TopoTiling.sliceElevations(spec, globalElevs, t.r, t.c);
       var Npt = t.m * t.n;
@@ -1359,7 +1315,6 @@ function doBuildTiled(model, useGoogle, fetchOpts) {
         world[p * 3 + 1] = t.uv[p * 2 + 1];
         world[p * 3 + 2] = elevs[p];
       }
-      if (t.cells) neutralizeUnusedCells(world, t.m, t.n, t.cells);
       var midLat = 0.5 * (t.bounds.north + t.bounds.south);
       var gridSpacing = spec.cellU * Math.cos(midLat * Math.PI / 180);
       return { model: tm, world: world, m: t.m, n: t.n, gridSpacing: gridSpacing,
