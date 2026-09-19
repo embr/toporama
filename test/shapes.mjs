@@ -164,36 +164,30 @@ function lShapeLngLat() {
     mask.kept < (grid.m - 1) * (grid.n - 1) * 0.85 &&
     mask.kept > (grid.m - 1) * (grid.n - 1) * 0.7,
     'kept=' + mask.kept + '/' + (grid.m - 1) * (grid.n - 1));
-  check('circle: every snap was safe (none skipped)', snap.skipped === 0,
-    'skipped=' + snap.skipped);
+  check('circle: every rim vertex reached the boundary', snap.stuck === 0 && snap.tooFar === 0,
+    'stuck=' + snap.stuck + ' tooFar=' + snap.tooFar + ' passes=' + snap.passes);
 
-  // the printed outline should follow the circle, not the grid staircase:
-  // measure the top surface's boundary radius in model units
+  // The printed outline should follow the circle, not the grid staircase.
+  // rescalePts is a pure scale about the origin and the circle is centred
+  // at local (0,0), so in model units the rim must sit at exactly half the
+  // requested width from (0,0) — no fitting or bbox proxy needed.
   const top = built.top, tv = top.vertices;
   const perim = Topo.perimeterEdges(top);
   const seen = new Set();
-  let minR = Infinity, maxR = -Infinity;
-  // model is centred by rescalePts at its bbox min, so re-centre on the bbox
-  let mnx = Infinity, mxx = -Infinity, mny = Infinity, mxy = -Infinity;
-  for (let i = 0; i < top.numVertices(); i++) {
-    mnx = Math.min(mnx, tv[i * 3]); mxx = Math.max(mxx, tv[i * 3]);
-    mny = Math.min(mny, tv[i * 3 + 1]); mxy = Math.max(mxy, tv[i * 3 + 1]);
-  }
-  const ox = (mnx + mxx) / 2, oy = (mny + mxy) / 2;
-  const modelR = (mxx - mnx) / 2;
-  for (let e = 0; e < perim.length; e++) {
-    const i = perim[e];
-    if (seen.has(i)) continue;
-    seen.add(i);
-    const rr = Math.hypot(tv[i * 3] - ox, tv[i * 3 + 1] - oy);
-    minR = Math.min(minR, rr); maxR = Math.max(maxR, rr);
-  }
-  const cellModel = (mxx - mnx) / (grid.n - 1);
-  check('circle: outline is round, not stepped',
-    modelR - minR < 0.9 * cellModel,
-    'radius spread=' + ((modelR - minR) / cellModel).toFixed(2) + ' cells');
-  check('circle: no boundary vertex outside the rim',
-    maxR <= modelR * 1.0001, 'maxR/R=' + (maxR / modelR).toFixed(5));
+  for (let e = 0; e < perim.length; e++) seen.add(perim[e]);
+  const expectR = 0.3 / 2;                       // output_x_meters / 2
+  const cellModel = 0.3 / (grid.n - 1);
+  const rims = [...seen].map(i => Math.hypot(tv[i * 3], tv[i * 3 + 1]));
+  const worst = Math.max(...rims.map(x => Math.abs(x - expectR)));
+  // a sawtooth of even a third of a cell is what makes a printed edge feel
+  // rough, so hold every rim vertex to a few percent of one cell
+  check('circle: every rim vertex sits on the true circle',
+    worst < 0.05 * cellModel,
+    'worst deviation=' + (worst / cellModel).toFixed(3) + ' cells over ' +
+    rims.length + ' rim vertices');
+  check('circle: rim never bulges outside the circle',
+    Math.max(...rims) <= expectR * 1.0001,
+    'maxR/R=' + (Math.max(...rims) / expectR).toFixed(5));
 }
 
 // ---------- concave polygon end-to-end ----------
@@ -201,8 +195,8 @@ function lShapeLngLat() {
   const s = Shape.poly(lShapeLngLat());
   const { built, mask, snap } = buildShaped(s, 110);
   meshChecks('L-polygon solid', built.solid);
-  check('L-polygon: about three quarters of cells kept',
-    mask.kept > 0 && snap.skipped === 0, 'kept=' + mask.kept);
+  check('L-polygon: cells kept and every rim vertex placed',
+    mask.kept > 0 && snap.stuck === 0, 'kept=' + mask.kept + ' stuck=' + snap.stuck);
   // the notch must really be empty: no top vertex in the NE quadrant
   const tv = built.top.vertices;
   let mnx = Infinity, mxx = -Infinity, mny = Infinity, mxy = -Infinity;
@@ -271,14 +265,26 @@ function lShapeLngLat() {
       if (area(v00, v11, v01) <= 0) bad++;
     }
   check('snap: no inverted or zero-area cells', bad === 0, 'bad=' + bad);
-  // interior vertices must not have moved at all
+  // Vertices well inside — every one of their four cells kept — must not
+  // move at all; only the rim is reshaped. (Vertices that are inside the
+  // shape but ON the kept region's edge DO move outward onto the boundary;
+  // that is what removes the sawtooth.)
   let movedInterior = 0;
-  for (let i = 0; i < grid.m * grid.n; i++) {
-    const u = before[i * 2], vv = before[i * 2 + 1];
-    if (!Shape.inside(s, fr, u, vv)) continue;
-    if (grid.uv[i * 2] !== u || grid.uv[i * 2 + 1] !== vv) movedInterior++;
-  }
-  check('snap: interior vertices untouched', movedInterior === 0,
+  for (let r = 0; r < grid.m; r++)
+    for (let c = 0; c < grid.n; c++) {
+      let allKept = true;
+      for (let dr = -1; dr <= 0; dr++)
+        for (let dc = -1; dc <= 0; dc++) {
+          const rr = r + dr, cc = c + dc;
+          if (rr < 0 || cc < 0 || rr >= grid.m - 1 || cc >= cw ||
+              !mask.cells[rr * cw + cc]) allKept = false;
+        }
+      if (!allKept) continue;
+      const i = r * grid.n + c;
+      if (grid.uv[i * 2] !== before[i * 2] ||
+          grid.uv[i * 2 + 1] !== before[i * 2 + 1]) movedInterior++;
+    }
+  check('snap: true interior vertices untouched', movedInterior === 0,
     'moved=' + movedInterior);
 }
 
@@ -331,7 +337,8 @@ function lShapeLngLat() {
   check('tiled circle: global mask dropped corners',
     mi.kept > 0 && mi.kept < (spec.NY - 1) * (spec.NX - 1) * 0.9,
     'kept=' + mi.kept);
-  check('tiled circle: no snap was skipped', mi.snap.skipped === 0);
+  check('tiled circle: every rim vertex reached the boundary',
+    mi.snap.stuck === 0, 'stuck=' + mi.snap.stuck);
 
   // shared edges must stay bit-identical THROUGH the mask + snap — this is
   // what breaks if masking is done per tile instead of globally

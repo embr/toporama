@@ -298,46 +298,83 @@
     return { cells: cells, kept: kept };
   }
 
-  // Pull every surviving corner that lies OUTSIDE the shape onto the true
+  // Pull EVERY vertex on the edge of the kept region onto the true
   // boundary, so a circle prints round instead of stepped. Mutates `uv`.
+  //
+  // Projecting only the corners that land outside the shape is not enough,
+  // and gives a visibly sawtoothed rim: the kept cells form a staircase,
+  // and the corners of that staircase which happen to fall INSIDE the
+  // shape would stay on the grid, so the outline alternates between the
+  // true boundary and points up to a full cell in from it. Every rim
+  // vertex has to reach the boundary for the edge to come out smooth —
+  // which also means some vertices move outward, not just inward.
   //
   // Moving vertices cannot change mesh topology, so watertightness is
   // unaffected; the only hazard is folding a triangle over itself, so each
   // move is shortened (halved up to 6 times) until every incident kept
-  // triangle keeps a positive signed area. A move that can't be made safe
+  // triangle keeps a positive signed area. A move that cannot be made safe
   // is skipped, leaving that one corner on the grid.
+  var SNAP_PASSES = 6;
+
   function snapBoundary(s, fr, uv, m, n, cellKeep) {
-    var moved = 0, skipped = 0;
-    for (var r = 0; r < m; r++) {
-      for (var c = 0; c < n; c++) {
-        if (!vertexUsed(cellKeep, m, n, r, c)) continue;
-        var i = (r * n + c) * 2;
+    // uv is still the pristine grid here, so the first row/column give the
+    // cell size; a rim vertex should never need to travel further than a
+    // cell or so, and anything that does means odd geometry — leave it.
+    var cellU = Math.abs(uv[(0 * n + 1) * 2] - uv[0]);
+    var cellV = Math.abs(uv[(1 * n) * 2 + 1] - uv[1]);
+    var maxMove = 1.5 * Math.max(cellU, cellV);
+    var tol2 = Math.pow(1e-6 * Math.max(cellU, cellV), 2);
+    var rim = [], r, c;
+    for (r = 0; r < m; r++)
+      for (c = 0; c < n; c++)
+        if (onKeptEdge(cellKeep, m, n, r, c)) rim.push(r * n + c);
+
+    // Vertices are moved one at a time and each move is fold-guarded
+    // against its neighbours' CURRENT positions, so a vertex processed
+    // early can be held back by a neighbour that has not moved yet. Repeat
+    // the sweep: each pass re-projects from where the vertex actually
+    // landed, so the leftover distance shrinks as the rim settles. Passes
+    // stop as soon as one changes nothing.
+    var moved = 0, stuck = 0, tooFar = 0, pass, k;
+    for (pass = 0; pass < SNAP_PASSES; pass++) {
+      var changed = 0;
+      stuck = 0;
+      for (k = 0; k < rim.length; k++) {
+        var g = rim[k], i = g * 2;
         var u = uv[i], v = uv[i + 1];
-        if (inside(s, fr, u, v)) continue;
         var p = projectToBoundary(s, fr, u, v);
         var du = p[0] - u, dv = p[1] - v;
-        var f = 1;
+        var d2 = du * du + dv * dv;
+        if (d2 <= tol2) continue;                  // already on the boundary
+        if (d2 > maxMove * maxMove) { tooFar++; continue; }
+        var f = 1, ok = false;
         for (var att = 0; att < 7; att++) {
           uv[i] = u + du * f; uv[i + 1] = v + dv * f;
-          if (cellsStayValid(uv, m, n, cellKeep, r, c)) break;
+          if (cellsStayValid(uv, m, n, cellKeep, (g / n) | 0, g % n)) { ok = true; break; }
           f /= 2;
-          if (att === 6) { uv[i] = u; uv[i + 1] = v; f = 0; }
         }
-        if (f > 0) moved++; else skipped++;
+        if (!ok) { uv[i] = u; uv[i + 1] = v; stuck++; continue; }
+        changed++;
+        if (pass === 0) moved++;
       }
+      if (!changed) break;
     }
-    return { moved: moved, skipped: skipped };
+    return { moved: moved, stuck: stuck, tooFar: tooFar, passes: pass + 1,
+             rim: rim.length };
   }
 
-  function vertexUsed(cellKeep, m, n, r, c) {
-    var cw = n - 1;
+  // A vertex on the rim of the kept region: at least one of its four
+  // incident cells survives and at least one is missing (off-grid counts
+  // as missing).
+  function onKeptEdge(cellKeep, m, n, r, c) {
+    var cw = n - 1, used = 0, missing = 0;
     for (var dr = -1; dr <= 0; dr++)
       for (var dc = -1; dc <= 0; dc++) {
         var rr = r + dr, cc = c + dc;
-        if (rr < 0 || cc < 0 || rr >= m - 1 || cc >= n - 1) continue;
-        if (cellKeep[rr * cw + cc]) return true;
+        if (rr < 0 || cc < 0 || rr >= m - 1 || cc >= n - 1) { missing++; continue; }
+        if (cellKeep[rr * cw + cc]) used++; else missing++;
       }
-    return false;
+    return used > 0 && missing > 0;
   }
 
   // Signed areas of the (up to 8) kept triangles touching vertex (r,c)
