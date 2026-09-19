@@ -74,11 +74,14 @@ printed width is that box's width.
 
 How it works: each shape carries a local frame (a centre plus a rotation),
 and the sample grid is built axis-aligned *in that frame* — which is why a
-rotated rectangle needs no mesh changes at all. Circles and polygons are
-that same grid with outside cells dropped and the surviving outside corners
-pulled onto the true boundary; the snap is fold-guarded, so the mesh stays
-watertight, and walls are extruded along oriented boundary edges so
-concave notches don't invert. See `shapes.js`.
+rotated rectangle needs no mesh changes at all. Circles and polygons use
+that same grid CLIPPED against the outline (`clip.js`): the grid keeps its
+own vertices and new ones are inserted where the boundary crosses it, so
+the printed edge is the outline itself, corners included. The underside
+repeats the construction against the outline offset inward by the wall
+thickness, which makes the base rim exactly that wide by construction.
+Nothing is ever moved, so interior elevations are untouched and there are
+no distorted cells along the edge.
 
 ## Tiling (models bigger than one print)
 
@@ -104,6 +107,7 @@ earlier build.
 node test/smoke.mjs
 node test/tiling.mjs
 node test/shapes.mjs
+node test/clip.mjs
 ```
 
 Stubs Leaflet + three.js and injects a synthetic terrarium tile, then drives

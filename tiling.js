@@ -13,10 +13,11 @@
  *   1. Uniform xy scale: the selection is split evenly in its local frame
  *      and each tile's output width is (total width / cols), so every
  *      tile's xyScale is identical.
- *   2. Shared samples: one global local-frame coordinate array is built
- *      (and masked/snapped once, globally) and tiles take slices of it, so
- *      two adjacent tiles read the SAME array elements for their shared
- *      edge — bit-identical lat/lng, hence bit-identical elevations.
+ *   2. Shared samples: one global local-frame coordinate array is built and
+ *      tiles take slices of it, so two adjacent tiles read the SAME array
+ *      elements for their shared edge — bit-identical lat/lng, hence
+ *      bit-identical elevations. Clipping never moves a sample, so this
+ *      holds for shaped selections too.
  *   3. One z transform: distortion normalization pins (dn_min/dn_max) and
  *      the z distortion factor are computed from the GLOBAL elevation
  *      range, and passed identically to every tile.
@@ -102,27 +103,7 @@
       vs[k] = (k === NY - 1) ? localBox.minV : localBox.maxV - k * vStep;
     return { us: us, vs: vs, NX: NX, NY: NY, mTile: mT, nTile: nT,
              rows: rows, cols: cols, frame: fr, localBox: localBox,
-             uRange: uRange, vRange: vRange, cellU: uStep, cellV: vStep,
-             uv: null, cells: null };
-  }
-
-  // Masking a tiled shape has to happen ONCE on the global grid, not per
-  // tile: the snap's fold guard looks at a vertex's neighbouring cells, and
-  // a tile can only see its own, so two tiles sharing an edge could
-  // otherwise shorten the same vertex's move differently and open a seam.
-  function maskGlobal(shape, spec) {
-    var NX = spec.NX, NY = spec.NY;
-    var uv = new Float64Array(NY * NX * 2), t = 0;
-    for (var j = 0; j < NY; j++) {
-      for (var k = 0; k < NX; k++) {
-        uv[t] = spec.us[k]; uv[t + 1] = spec.vs[j]; t += 2;
-      }
-    }
-    var mask = Shape.cellMask(shape, spec.frame, uv, NY, NX);
-    var snap = Shape.snapBoundary(shape, spec.frame, uv, NY, NX, mask.cells);
-    spec.uv = uv;
-    spec.cells = mask.cells;
-    return { kept: mask.kept, snap: snap };
+             uRange: uRange, vRange: vRange, cellU: uStep, cellV: vStep };
   }
 
   // Grid for tile (r, c): row-major [lng,lat] and local [u,v] pairs, row 0
@@ -135,13 +116,7 @@
     var t = 0;
     for (var j = 0; j < mT; j++) {
       for (var k = 0; k < nT; k++) {
-        var u, v;
-        if (spec.uv) {                      // snapped global coordinates
-          var g = ((j0 + j) * spec.NX + k0 + k) * 2;
-          u = spec.uv[g]; v = spec.uv[g + 1];
-        } else {
-          u = spec.us[k0 + k]; v = spec.vs[j0 + j];
-        }
+        var u = spec.us[k0 + k], v = spec.vs[j0 + j];
         var ll = Shape.localToLngLat(fr, u, v);
         pts[t] = ll[0]; pts[t + 1] = ll[1];
         uv[t] = u; uv[t + 1] = v;
@@ -164,26 +139,8 @@
     return {
       r: r, c: c, pts: pts, uv: uv, m: mT, n: nT, j0: j0, k0: k0,
       localBox: lb,
-      bounds: { north: north, south: south, east: east, west: west },
-      cells: spec.cells ? sliceCells(spec, r, c) : null
+      bounds: { north: north, south: south, east: east, west: west }
     };
-  }
-
-  // This tile's slice of the global cell mask.
-  function sliceCells(spec, r, c) {
-    var mT = spec.mTile, nT = spec.nTile;
-    var j0 = r * (mT - 1), k0 = c * (nT - 1);
-    var gcw = spec.NX - 1, cw = nT - 1;
-    var out = new Uint8Array((mT - 1) * cw), kept = 0, t = 0;
-    for (var j = 0; j < mT - 1; j++) {
-      for (var k = 0; k < cw; k++) {
-        var val = spec.cells[(j0 + j) * gcw + k0 + k];
-        out[t++] = val;
-        if (val) kept++;
-      }
-    }
-    out.keptCount = kept;
-    return out;
   }
 
   // Copy tile (r, c)'s elevations out of a global (NY x NX) elevation
@@ -261,9 +218,7 @@
     seamLines: seamLines,
     seamLinesLocal: seamLinesLocal,
     buildGridSpec: buildGridSpec,
-    maskGlobal: maskGlobal,
     tileSlice: tileSlice,
-    sliceCells: sliceCells,
     sliceElevations: sliceElevations,
     placeElevations: placeElevations,
     distortValue: distortValue,

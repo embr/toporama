@@ -426,96 +426,6 @@
     return new Mesh(verts, gridFaces(rows, cols));
   }
 
-  // Grid mesh for a MASKED grid: only cells flagged in cellKeep become
-  // faces, and the surviving vertices are compacted. Used for circles and
-  // polygons, whose grids have cells outside the shape dropped; plain
-  // rectangles keep using makeTop's padded path unchanged.
-  //
-  // `pts` is (x,y,z)*m*n in the shape's local frame, and cellKeep is
-  // (m-1)*(n-1) flags indexed r*(n-1)+c. Winding matches gridFaces, so
-  // every face still points up.
-  function makeTopShaped(pts, m, n, cellKeep) {
-    var cw = n - 1, ch = m - 1, k;
-    var nQuads = 0;
-    for (k = 0; k < ch * cw; k++) if (cellKeep[k]) nQuads++;
-    if (!nQuads) throw new Error('the shape covers no grid cells — enlarge it or raise the grid points');
-    var slot = new Int32Array(m * n);
-    for (k = 0; k < slot.length; k++) slot[k] = -1;
-    var gridOf = new Int32Array(m * n);
-    var faces = new Int32Array(nQuads * 6);
-    var V = 0, t = 0;
-    function idx(g) {
-      if (slot[g] < 0) { slot[g] = V; gridOf[V] = g; V++; }
-      return slot[g];
-    }
-    for (var r = 0; r < ch; r++) {
-      for (var c = 0; c < cw; c++) {
-        if (!cellKeep[r * cw + c]) continue;
-        var v00 = idx(r * n + c), v01 = idx(r * n + c + 1);
-        var v10 = idx((r + 1) * n + c), v11 = idx((r + 1) * n + c + 1);
-        faces[t++] = v00; faces[t++] = v10; faces[t++] = v11;
-        faces[t++] = v00; faces[t++] = v11; faces[t++] = v01;
-      }
-    }
-    var verts = new Float64Array(V * 3);
-    for (var i = 0; i < V; i++) {
-      var g = gridOf[i] * 3;
-      verts[i * 3] = pts[g];
-      verts[i * 3 + 1] = pts[g + 1];
-      verts[i * 3 + 2] = pts[g + 2];
-    }
-    return { mesh: new Mesh(verts, faces), gridOf: gridOf.subarray(0, V) };
-  }
-
-  // Distance (in model metres) from every grid vertex to the nearest edge
-  // of the kept region, by two-pass chamfer transform. This replaces the
-  // bounding-box band of getWallVertexMask for masked shapes: the walls of
-  // a circle, a polygon, or a partially covered tile follow the mesh's own
-  // boundary rather than its bbox.
-  function gridBoundaryDistance(m, n, cellKeep, cellU, cellV) {
-    var cw = n - 1, ch = m - 1, N = m * n, i, r, c;
-    var dist = new Float64Array(N);
-    for (i = 0; i < N; i++) dist[i] = Infinity;
-    function kept(rr, cc) {
-      if (rr < 0 || cc < 0 || rr >= ch || cc >= cw) return 0;
-      return cellKeep[rr * cw + cc];
-    }
-    for (r = 0; r < m; r++) {
-      for (c = 0; c < n; c++) {
-        var a = kept(r - 1, c - 1), b = kept(r - 1, c);
-        var d = kept(r, c - 1), e = kept(r, c);
-        if (!(a || b || d || e)) continue;            // vertex is unused
-        if (!(a && b && d && e)) dist[r * n + c] = 0; // on the boundary
-      }
-    }
-    var dD = Math.sqrt(cellU * cellU + cellV * cellV), best;
-    for (r = 0; r < m; r++) {
-      for (c = 0; c < n; c++) {
-        i = r * n + c; best = dist[i];
-        if (r > 0) {
-          if (dist[i - n] + cellV < best) best = dist[i - n] + cellV;
-          if (c > 0 && dist[i - n - 1] + dD < best) best = dist[i - n - 1] + dD;
-          if (c < n - 1 && dist[i - n + 1] + dD < best) best = dist[i - n + 1] + dD;
-        }
-        if (c > 0 && dist[i - 1] + cellU < best) best = dist[i - 1] + cellU;
-        dist[i] = best;
-      }
-    }
-    for (r = m - 1; r >= 0; r--) {
-      for (c = n - 1; c >= 0; c--) {
-        i = r * n + c; best = dist[i];
-        if (r < m - 1) {
-          if (dist[i + n] + cellV < best) best = dist[i + n] + cellV;
-          if (c > 0 && dist[i + n - 1] + dD < best) best = dist[i + n - 1] + dD;
-          if (c < n - 1 && dist[i + n + 1] + dD < best) best = dist[i + n + 1] + dD;
-        }
-        if (c < n - 1 && dist[i + 1] + cellU < best) best = dist[i + 1] + cellU;
-        dist[i] = best;
-      }
-    }
-    return dist;
-  }
-
   function makeBottomHull(top, minTopThickness, minSideThickness, minZval, wallMaskIn) {
     var V = top.numVertices();
     var vn = vertexNormals(top);
@@ -627,43 +537,6 @@
     }
     fixNormals(sides, minx + 0.5 * (maxx - minx), miny + 0.5 * (maxy - miny));
     return sides;
-  }
-
-  // Walls for a mesh whose boundary is NOT its bounding box — a circle, a
-  // polygon, a partially covered tile. Each boundary edge is extruded in
-  // the direction it runs in its owning face, so the quad comes out wound
-  // outward by construction. makeSides' "point away from the footprint
-  // centre" rule cannot do that: inside a concave notch the true outward
-  // normal points toward the centre, so those walls would invert and the
-  // winding check would fail.
-  function makeSidesOriented(top, bottom) {
-    var perim = perimeterEdges(top);
-    var pending = new Set();
-    var e, i, j, key;
-    for (e = 0; e < perim.length; e += 2) {
-      i = perim[e]; j = perim[e + 1];
-      pending.add((i < j ? i : j) + '_' + (i < j ? j : i));
-    }
-    var nTop = top.numVertices();
-    var f = top.faces, F = top.numFaces();
-    var quads = new Int32Array(perim.length * 2);    // 4 indices per edge
-    var q = 0;
-    for (var t = 0; t < F && pending.size; t++) {
-      var tri = [f[t * 3], f[t * 3 + 1], f[t * 3 + 2], f[t * 3]];
-      for (var k = 0; k < 3; k++) {
-        i = tri[k]; j = tri[k + 1];
-        key = (i < j ? i : j) + '_' + (i < j ? j : i);
-        if (!pending.has(key)) continue;
-        pending.delete(key);
-        quads[q++] = i; quads[q++] = i + nTop;
-        quads[q++] = j + nTop; quads[q++] = j;
-      }
-    }
-    var faces = triangulateQuads(quads.subarray(0, q));
-    var allVerts = new Float64Array(top.vertices.length + bottom.vertices.length);
-    allVerts.set(top.vertices, 0);
-    allVerts.set(bottom.vertices, top.vertices.length);
-    return new Mesh(allVerts, faces);
   }
 
   function unionMeshes(meshes) {
@@ -1162,41 +1035,11 @@
       return buildClipped(model, ptsWorld, m, n, info);
     }
 
-    // A masked grid (circle, polygon, or a tile only partly covered by
-    // one) drops cells and so has a boundary that is not its bbox: build
-    // the top from the mask, derive the wall band from the mesh's own
-    // boundary, and extrude the walls along oriented boundary edges.
-    var shaped = model.cell_keep ? makeTopShaped(ptsWorld, m, n, model.cell_keep) : null;
     var minZarg = (model.min_z_val === undefined ? null : model.min_z_val);
-    var top, bottom, wallMask = null;
-    if (shaped) {
-      top = shaped.mesh;
-      wallMask = new Uint8Array(top.numVertices());
-      if (model.wall_grid) {
-        // the caller placed the band and put its inner ring exactly on the
-        // inward offset of the outline, so the printed rim is an even width
-        // instead of a staircase (see shapes.js wallBand)
-        for (var wi = 0; wi < wallMask.length; wi++)
-          wallMask[wi] = model.wall_grid[shaped.gridOf[wi]];
-      } else {
-        var gdist = gridBoundaryDistance(m, n, model.cell_keep,
-          (model.cell_u || 0) * info.xy_scale, (model.cell_v || 0) * info.xy_scale);
-        for (var wj = 0; wj < wallMask.length; wj++)
-          wallMask[wj] = gdist[shaped.gridOf[wj]] <= model.wall_thickness ? 1 : 0;
-      }
-      info.masked_cells_kept = top.numFaces() / 2;
-      bottom = makeBottom(top, model.top_thickness, model.wall_thickness,
-        minZarg, wallMask);
-    } else {
-      top = makeTop(ptsWorld, m, n, model.top_pad_width);
-      bottom = makeBottom(top, model.top_thickness, model.wall_thickness, minZarg);
-    }
-    // Pin holes locate their cells through the padded rectangular grid, so
-    // they do not apply to a masked shape yet; the caller is told rather
-    // than silently dropping them.
+    var top = makeTop(ptsWorld, m, n, model.top_pad_width);
+    var bottom = makeBottom(top, model.top_thickness, model.wall_thickness, minZarg);
     var wantPins = !!(model.pin_holes && model.pin_holes.locations &&
       model.pin_holes.locations.length);
-    if (wantPins && shaped) { info.pin_holes_unsupported = true; wantPins = false; }
     if (wantPins) {
       // deepen the base if a tilted pin hole needs more room for its
       // vertical guide collar (makes the model slightly taller rather
@@ -1212,7 +1055,7 @@
     }
     // outer sides come from the UNCUT perimeter; pin holes only ever remove
     // interior cells, so cutting after this is safe
-    var sides = shaped ? makeSidesOriented(top, bottom) : makeSides(top, bottom);
+    var sides = makeSides(top, bottom);
     var pieces = [top, bottom, sides];
     if (wantPins) {
       var cut = cutPinHoles(top, bottom, m, n, model.pin_holes, scale.xyScale);
@@ -1599,10 +1442,7 @@
     makeTop: makeTop,
     makeBottomHull: makeBottomHull,
     makeBottom: makeBottom,
-    makeTopShaped: makeTopShaped,
-    gridBoundaryDistance: gridBoundaryDistance,
     makeSides: makeSides,
-    makeSidesOriented: makeSidesOriented,
     unionMeshes: unionMeshes,
     powerFunctionDistort: powerFunctionDistort,
     rescalePts: rescalePts,
