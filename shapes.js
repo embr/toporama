@@ -279,6 +279,18 @@
              cellU: uStep, cellV: vStep };
   }
 
+  // Re-derive the lat/lng of every sample from its CURRENT local position.
+  // Snapping moves vertices after the grid is laid out, and elevation is
+  // fetched per lat/lng, so without this a moved vertex would carry the
+  // height of the spot it started at — up to a grid step of error right
+  // where the model is most visible, its edge.
+  function refreshLngLat(fr, uv, pts, count) {
+    for (var i = 0; i < count; i++) {
+      var ll = localToLngLat(fr, uv[i * 2], uv[i * 2 + 1]);
+      pts[i * 2] = ll[0]; pts[i * 2 + 1] = ll[1];
+    }
+  }
+
   // ---- masking -----------------------------------------------------------
   // Which grid cells survive: a cell is kept when its center is inside the
   // shape. Cells are (m-1) x (n-1), indexed r*(n-1)+c with corners
@@ -706,6 +718,7 @@
     containsLngLat: containsLngLat, centerLatLng: centerLatLng,
     gridDims: gridDims, buildGrid: buildGrid, sampleGrid: sampleGrid,
     cellMask: cellMask, snapBoundary: snapBoundary, wallBand: wallBand,
+    refreshLngLat: refreshLngLat,
     encode: encode, decode: decode,
     CIRCLE_SEGMENTS: CIRCLE_SEGMENTS
   };

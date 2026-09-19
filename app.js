@@ -848,6 +848,8 @@ function prepareShapeGrid(model, maxPts, what, fr, localBox) {
     model.cell_v = grid.cellV;
     model.wall_grid = shapeWallBand(model, shape, fr, grid.uv, grid.m, grid.n,
       mask.cells, localBox || fr);
+    // vertices moved, so re-derive where to sample elevation
+    TopoShape.refreshLngLat(fr, grid.uv, grid.pts, grid.m * grid.n);
   }
   grid.mask = mask;
   return grid;
@@ -1215,6 +1217,21 @@ function doBuildTiled(model, useGoogle, fetchOpts) {
     for (var c = 0; c < layout.cols; c++) {
       var sl = TopoTiling.tileSlice(spec, r, c);
       if (sl.cells && !sl.cells.keptCount) continue;
+      if (sl.cells) {
+        // Place the band per tile — a tile's seam cuts are boundaries too
+        // and need their own wall. It has to happen BEFORE elevation is
+        // fetched, because it moves vertices and each one's height is read
+        // at its lat/lng. `model` (not the per-tile copy) carries the
+        // global width, which is what pairs with the global frame to give
+        // the right scale. Seam vertices are rim vertices and never move,
+        // so tiles still meet exactly.
+        sl.wallGrid = shapeWallBand(model, shape, fr, sl.uv, sl.m, sl.n,
+          sl.cells, sl.localBox, {
+            minU: c > 0, maxU: c < layout.cols - 1,
+            minV: r < layout.rows - 1, maxV: r > 0
+          });
+        TopoShape.refreshLngLat(fr, sl.uv, sl.pts, sl.m * sl.n);
+      }
       slices.push(sl);
     }
   }
@@ -1328,14 +1345,7 @@ function doBuildTiled(model, useGoogle, fetchOpts) {
       if (t.cells) {
         tm.cell_keep = t.cells;
         tm.cell_u = spec.cellU; tm.cell_v = spec.cellV;
-        // per tile, because a tile's seam cuts are boundaries too and need
-        // their own wall; seam vertices are never moved, so tiles still
-        // meet exactly
-        tm.wall_grid = shapeWallBand(tm, shape, fr, t.uv, t.m, t.n,
-          t.cells, t.localBox, {
-            minU: t.c > 0, maxU: t.c < layout.cols - 1,
-            minV: t.r < layout.rows - 1, maxV: t.r > 0
-          });
+        tm.wall_grid = t.wallGrid;      // placed before the elevation fetch
       } else {
         delete tm.cell_keep;
         delete tm.wall_grid;
