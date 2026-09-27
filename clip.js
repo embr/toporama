@@ -435,8 +435,16 @@
       var len = Math.sqrt(bx * bx + by * by);
       if (len < 1e-9) { bx = n1[0]; by = n1[1]; len = 1; }
       bx /= len; by /= len;
+      // The miter is not an approximation to be reined in — it IS the
+      // inset at a corner: every point nearer the tip than the miter lies
+      // within d of an edge, so it is not in the inset region. Capping it
+      // pulls the vertex toward the tip and thins the rim in exact
+      // proportion (a 9-degree star point capped at 4d measured 0.63d of
+      // rim). The floor here only guards a 180-degree turn from running to
+      // infinity; a spike too thin to hold a cavity is caught by
+      // offsetIsSane, which is where that judgement belongs.
       var cosHalf = bx * n1[0] + by * n1[1];
-      var scale = d / Math.max(cosHalf, 0.25);       // cap the miter at 4d
+      var scale = d / Math.max(cosHalf, 0.02);       // guard only, ~50d
       out.push([p[0] + bx * scale, p[1] + by * scale]);
     }
     return out;
@@ -450,23 +458,56 @@
 
   // Is the offset still a usable ring, or has the wall eaten the cavity?
   //
-  // Area and winding alone are not enough to tell: offsetting a small
-  // circle inward by more than its radius sends every vertex through the
-  // centre and out the far side, which lands a perfectly valid-looking
-  // smaller ring that is nothing like an offset. The test that catches it
-  // is the defining property — an offset vertex should sit `d` away from
-  // the ring it came from.
+  // The test is whether the ring stays SIMPLE. An earlier version demanded
+  // that each offset vertex sit within 25% of d of the outline, which
+  // sounds equivalent and is not: near a concave corner the nearest point
+  // of the outline is the corner itself, so a perfectly correct offset
+  // measures d/cos(half-angle) there. That rejected every star sharper
+  // than about 19 degrees — all of them with zero self-intersections and
+  // sensible area — and dropped those models to solid for no reason.
+  //
+  // The right invariant is the defining one: the inset must stand AT LEAST
+  // d clear of the whole outline. That accepts a star (its tips measure
+  // exactly d, its concave corners more) and still rejects an offset that
+  // has collapsed through itself — inset a circle of radius 5 by 9 and
+  // every vertex flies through the centre to land 4 out the far side,
+  // which keeps a positive area, a smaller ring and no crossings, but sits
+  // 1 from the outline instead of 9. Distance to the adjacent edges cannot
+  // catch that: the construction puts the vertex d from those two lines by
+  // definition, whatever it does to the rest of the shape.
   function offsetIsSane(ringCCW, offs, d, minAreaFrac) {
     var ao = ringArea(ringCCW), ai = ringArea(offs);
     if (!(ai > 0) || ai >= ao) return false;
     if (ai < (minAreaFrac || 0.02) * ao) return false;
     if (!offs.every(function (p) { return pointInRing(ringCCW, p[0], p[1]); }))
       return false;
+    if (selfIntersects(offs)) return false;
     if (d === undefined) return true;
-    var ds = offs.map(function (p) { return distToRing(ringCCW, p[0], p[1]); });
-    ds.sort(function (a, b) { return a - b; });
-    var median = ds[ds.length >> 1];
-    return Math.abs(median - d) <= 0.25 * d;
+    return offs.every(function (p) {
+      return distToRing(ringCCW, p[0], p[1]) >= 0.9 * d;
+    });
+  }
+
+  // Proper segment crossings only — rings share endpoints by construction,
+  // so neighbours are skipped.
+  function selfIntersects(ring) {
+    var n = ring.length;
+    for (var i = 0; i < n; i++) {
+      for (var j = i + 2; j < n; j++) {
+        if (i === 0 && j === n - 1) continue;
+        if (segmentsCross(ring[i], ring[(i + 1) % n], ring[j], ring[(j + 1) % n]))
+          return true;
+      }
+    }
+    return false;
+  }
+  function segmentsCross(a, b, c, d) {
+    var d1 = cross3(c, d, a), d2 = cross3(c, d, b);
+    var d3 = cross3(a, b, c), d4 = cross3(a, b, d);
+    return ((d1 > 0) !== (d2 > 0)) && ((d3 > 0) !== (d4 > 0));
+  }
+  function cross3(o, p, q) {
+    return (p[0] - o[0]) * (q[1] - o[1]) - (p[1] - o[1]) * (q[0] - o[0]);
   }
   function distToRing(ring, u, v) {
     var best = Infinity;
@@ -702,7 +743,8 @@
     gridSpec: gridSpec, densifyRing: densifyRing, clipGrid: clipGrid,
     earClip: earClip, offsetRingInward: offsetRingInward,
     clipRingToBox: clipRingToBox,
-    offsetIsSane: offsetIsSane, wallStrip: wallStrip,
+    offsetIsSane: offsetIsSane, selfIntersects: selfIntersects,
+    wallStrip: wallStrip,
     stitchAnnulus: stitchAnnulus, ringLoop: ringLoop,
     reparamAgainstOutline: reparamAgainstOutline, buildShell: buildShell
   };

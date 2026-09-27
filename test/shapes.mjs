@@ -360,23 +360,67 @@ function lShapeLngLat() {
   }
 }
 
-// ---------- a shape too narrow for a cavity is reported, not hidden ------
+// ---------- a cavity is kept whenever it fits, and reported when not ----
+// The check that decides this used to demand each offset vertex sit within
+// 25% of the wall thickness of the outline. Near a concave corner the
+// nearest outline point is the corner itself, so a correct offset measures
+// d/cos(half-angle) there — which rejected every star sharper than about
+// 19 degrees and printed them solid for no reason. The invariant is that
+// the inset stands AT LEAST a wall thickness clear, not about one.
 {
   const baseFr = Shape.frame(Shape.rect(CENTER, 1, 1, 0));
-  const sharp = [];
-  for (let i = 0; i < 10; i++) {
-    const a = -Math.PI / 2 + Math.PI * i / 5;
-    const r = (i % 2 === 0) ? 9000 : 2000;         // very narrow points
-    sharp.push([r * Math.cos(a), r * Math.sin(a)]);
+  const mkStar = (rIn) => {
+    const p = [];
+    for (let i = 0; i < 10; i++) {
+      const a2 = -Math.PI / 2 + Math.PI * i / 5;
+      const r = (i % 2 === 0) ? 9000 : rIn;
+      p.push([r * Math.cos(a2), r * Math.sin(a2)]);
+    }
+    return Shape.poly(p.map(q => Shape.localToLngLat(baseFr, q[0], q[1])));
+  };
+  for (const rIn of [3600, 2000, 1400]) {
+    const res = buildShaped(mkStar(rIn), 250,
+      { wall_thickness: 0.001, output_x_meters: 0.2 });
+    check('star rIn=' + rIn + ': keeps its cavity',
+      !res.built.info.printed_solid);
+    meshChecks('star rIn=' + rIn, res.built.solid);
   }
-  const shp = Shape.poly(sharp.map(p => Shape.localToLngLat(baseFr, p[0], p[1])));
-  const res = buildShaped(shp, 250, { wall_thickness: 0.001, output_x_meters: 0.2 });
-  check('sharp star: still a valid solid', Topo.isWatertight(res.built.solid) &&
-    Topo.isWindingConsistent(res.built.solid));
-  check('sharp star: reports that it was printed solid',
-    res.built.info.printed_solid === true,
-    'printed_solid=' + res.built.info.printed_solid);
-  // and a shape with room for the cavity must NOT be flagged
+
+  // the rim at a sharp point must be a full wall thickness: capping the
+  // miter used to pull those vertices in and thin it to 0.63 and 0.42
+  const fr = Shape.frame(mkStar(2000));
+  const outline = Clip.toCCW(Shape.localRing(mkStar(2000), fr));
+  const wtLocal = 90;
+  const offs = Clip.offsetRingInward(outline, wtLocal);
+  const dist = (u, v) => {
+    let best = Infinity;
+    for (let i = 0, j = outline.length - 1; i < outline.length; j = i++) {
+      const ax = outline[j][0], ay = outline[j][1];
+      const ex = outline[i][0] - ax, ey = outline[i][1] - ay;
+      const L2 = ex * ex + ey * ey;
+      let t = L2 ? ((u - ax) * ex + (v - ay) * ey) / L2 : 0;
+      t = Math.max(0, Math.min(1, t));
+      best = Math.min(best, Math.hypot(u - ax - t * ex, v - ay - t * ey));
+    }
+    return best;
+  };
+  const rims = offs.map(p => dist(p[0], p[1]) / wtLocal);
+  check('sharp star: the rim is never thinner at a point',
+    Math.min(...rims) >= 0.99,
+    'thinnest=' + Math.min(...rims).toFixed(3) + ' x wt');
+
+  // A shape that genuinely cannot hold a cavity still says so. The bbox is
+  // 8000 local units for a 0.2 m model, so a 0.001 m wall is 40 units; at a
+  // half-width of 25 the inset has nowhere to go.
+  const sliver = Shape.poly([[-4000, -25], [4000, -25], [4000, 25], [-4000, 25]]
+    .map(p => Shape.localToLngLat(baseFr, p[0], p[1])));
+  const thin = buildShaped(sliver, 250,
+    { wall_thickness: 0.001, output_x_meters: 0.2 });
+  check('sliver narrower than two wall thicknesses: printed solid',
+    thin.built.info.printed_solid === true,
+    'printed_solid=' + thin.built.info.printed_solid);
+  check('sliver: still a valid solid', Topo.isWatertight(thin.built.solid) &&
+    Topo.isWindingConsistent(thin.built.solid));
   const roomy = buildShaped(Shape.circle(CENTER, 9000), 250,
     { wall_thickness: 0.001, output_x_meters: 0.2 });
   check('circle: not flagged as solid', !roomy.built.info.printed_solid);
