@@ -16,6 +16,15 @@ self.onmessage = function (e) {
 
     var checks = Topo.checkShell(built.top, built.bottom,
       model.style || 'plain').concat(Topo.checkSolid(solid));
+    // A shape with narrow points cannot hold a cavity: inset by the wall
+    // thickness, its outline turns inside out there, so the model is built
+    // solid instead. That is a large jump in material, and print services
+    // price on material — so say it rather than letting it pass quietly.
+    if (built.info.printed_solid)
+      checks.push({ check: 'solid_fill', level: 'WARN',
+        message: 'printed SOLID, not hollow — the wall thickness does not ' +
+          'fit inside this outline\'s narrow points, so it uses far more ' +
+          'material; widen the shape or choose a thinner-walled style' });
     var summary = Topo.summarize(checks);
 
     if (!model.tiled) Topo.centerAtOrigin(solid);

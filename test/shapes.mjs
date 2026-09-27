@@ -308,6 +308,80 @@ function lShapeLngLat() {
   }
 }
 
+// ---------- the base band pairs points that face each other ----------
+// stitchAnnulus matched points by fraction-along-segment, but an offset
+// edge is parallel to its outline edge and a DIFFERENT length, so equal
+// fractions are not opposite each other and the pairing slid along the
+// boundary. A star shows it worst (measured 1.79 x the wall thickness of
+// drift, stretching the band's rungs to 2.05 x); a circle never did,
+// because all its segments are the same length.
+{
+  const WT = 0.001, OUT_X = 0.2;
+  const baseFr = Shape.frame(Shape.rect(CENTER, 1, 1, 0));
+  const starPts = [];
+  for (let i = 0; i < 10; i++) {
+    const a = -Math.PI / 2 + Math.PI * i / 5;
+    const r = (i % 2 === 0) ? 9000 : 3600;
+    starPts.push([r * Math.cos(a), r * Math.sin(a)]);
+  }
+  const cases = [
+    ['star', Shape.poly(starPts.map(p => Shape.localToLngLat(baseFr, p[0], p[1])))],
+    ['circle', Shape.circle(CENTER, 9000)]
+  ];
+  for (const [label, shp] of cases) {
+    const res = buildShaped(shp, 300, { wall_thickness: WT, output_x_meters: OUT_X });
+    const solid = res.built.solid, v = solid.vertices, f = solid.faces;
+    meshChecks(label + ' band', solid);
+    let minZ = Infinity;
+    for (let i = 0; i < solid.numVertices(); i++)
+      minZ = Math.min(minZ, v[i * 3 + 2]);
+    const onBase = i => Math.abs(v[i * 3 + 2] - minZ) < 1e-12;
+    const edges = [];
+    for (let k = 0; k < f.length; k += 3) {
+      const t = [f[k], f[k + 1], f[k + 2]];
+      if (!t.every(onBase)) continue;
+      for (let e = 0; e < 3; e++) {
+        const p = t[e], q = t[(e + 1) % 3];
+        edges.push(Math.hypot(v[q * 3] - v[p * 3], v[q * 3 + 1] - v[p * 3 + 1]) / WT);
+      }
+    }
+    edges.sort((a, b) => a - b);
+    const med = edges[Math.floor(0.5 * (edges.length - 1))];
+    const p99 = edges[Math.floor(0.99 * (edges.length - 1))];
+    const over2 = edges.filter(x => x > 2).length / edges.length;
+    // a correctly paired band has rungs of one wall thickness, and the
+    // diagonals between them barely longer
+    check(label + ': band rungs are one wall thickness', Math.abs(med - 1) < 0.05,
+      'median=' + med.toFixed(3) + ' x wt');
+    check(label + ': band rungs do not drift along the boundary', p99 < 1.6,
+      'p99=' + p99.toFixed(2) + ' x wt');
+    check(label + ': almost nothing spans more than two wall thicknesses',
+      over2 < 0.01, (over2 * 100).toFixed(2) + '% over 2x of ' + edges.length);
+  }
+}
+
+// ---------- a shape too narrow for a cavity is reported, not hidden ------
+{
+  const baseFr = Shape.frame(Shape.rect(CENTER, 1, 1, 0));
+  const sharp = [];
+  for (let i = 0; i < 10; i++) {
+    const a = -Math.PI / 2 + Math.PI * i / 5;
+    const r = (i % 2 === 0) ? 9000 : 2000;         // very narrow points
+    sharp.push([r * Math.cos(a), r * Math.sin(a)]);
+  }
+  const shp = Shape.poly(sharp.map(p => Shape.localToLngLat(baseFr, p[0], p[1])));
+  const res = buildShaped(shp, 250, { wall_thickness: 0.001, output_x_meters: 0.2 });
+  check('sharp star: still a valid solid', Topo.isWatertight(res.built.solid) &&
+    Topo.isWindingConsistent(res.built.solid));
+  check('sharp star: reports that it was printed solid',
+    res.built.info.printed_solid === true,
+    'printed_solid=' + res.built.info.printed_solid);
+  // and a shape with room for the cavity must NOT be flagged
+  const roomy = buildShaped(Shape.circle(CENTER, 9000), 250,
+    { wall_thickness: 0.001, output_x_meters: 0.2 });
+  check('circle: not flagged as solid', !roomy.built.info.printed_solid);
+}
+
 // ---------- pin holes in a rotated frame ----------
 {
   // A rotated selection's mesh axes are its own, not absolute mercator, so

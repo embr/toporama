@@ -613,6 +613,36 @@
     if (out.length > 1 && out[0].id === out[out.length - 1].id) out.pop();
     return out;
   }
+  // Re-parameterize the inner loop against the OUTLINE, so the base band
+  // pairs each point with the one it truly sits opposite.
+  //
+  // stitchAnnulus matches points by "fraction along the segment", and an
+  // offset edge is parallel to its outline edge but a DIFFERENT LENGTH —
+  // shorter at a convex corner, longer at a concave one. Equal fractions
+  // are therefore not opposite each other, and the pairing slides along the
+  // boundary: measured on a 5-point star, 1.79 x the wall thickness at the
+  // middle of an edge, which stretched the band's rungs to 2.05 x. A circle
+  // has all-equal segments, so it never showed the drift.
+  //
+  // Since the offset edge is parallel and exactly wt inside, every point on
+  // it has a perpendicular foot on the outline edge — that foot is the
+  // correct partner, and its position along the outline is the parameter to
+  // sort by. The clamp keeps the sequence non-decreasing across a corner,
+  // where the foot can fall past the end of the edge; there the corner
+  // itself is the nearest outline point, which is what clamping picks.
+  function reparamAgainstOutline(innerLoop, outlineCCW) {
+    var n = outlineCCW.length;
+    return innerLoop.map(function (p) {
+      var i = ((p.seg % n) + n) % n;
+      var a = outlineCCW[i], b = outlineCCW[(i + 1) % n];
+      var ex = b[0] - a[0], ey = b[1] - a[1];
+      var L2 = ex * ex + ey * ey;
+      var t = L2 ? ((p.u - a[0]) * ex + (p.v - a[1]) * ey) / L2 : 0;
+      t = t < 0 ? 0 : (t > 1 ? 1 : t);
+      return { id: p.id, u: p.u, v: p.v, z: p.z, seg: i, t: t };
+    });
+  }
+
   function loopXYZ(loop, zOverride) {
     return loop.map(function (p) {
       return [p.u, p.v, zOverride === undefined ? p.z : zOverride];
@@ -660,7 +690,8 @@
     info.fallback += cavity.fallback;
     cavity.why.forEach(function (w) { w.where = 'offset'; info.why.push(w); });
     var innerLoop = ringLoop(cavity);
-    pieces.push(stitchAnnulus(outerLoop, innerLoop, minZ));
+    pieces.push(stitchAnnulus(outerLoop,
+      reparamAgainstOutline(innerLoop, ring), minZ));
     pieces.push(wallStrip(loopXYZ(innerLoop), loopXYZ(innerLoop, minZ), true));
     pieces.push({ vertices: cavity.vertices, faces: flipFaces(cavity.faces) });
     return { pieces: pieces, info: info };
@@ -672,6 +703,7 @@
     earClip: earClip, offsetRingInward: offsetRingInward,
     clipRingToBox: clipRingToBox,
     offsetIsSane: offsetIsSane, wallStrip: wallStrip,
-    stitchAnnulus: stitchAnnulus, buildShell: buildShell
+    stitchAnnulus: stitchAnnulus, ringLoop: ringLoop,
+    reparamAgainstOutline: reparamAgainstOutline, buildShell: buildShell
   };
 }));
